@@ -10,6 +10,7 @@
 | 扩展设计 | [Dramlo 扩展库与导入规范草案](studio-extension-library.md) | 扩展管理、节点贡献、导入和开发规范调整时。 |
 | 用户 | [Dramlo 操作手册](studio-operation-manual.md) · [外部 Agent 接入指南](studio-operation-manual.md#3-接入外部-agent) | 界面、配置、MCP 操作、结果反馈和故障接手方式变化时。 |
 | 工程 | [内置 Agent 盘点与运行时迁移清单](studio-agent-migration.md) | 源码职责、技术迁移、测试或兼容性变化时。 |
+| 版本 | [Dramlo 更新日志](../CHANGELOG.md) | 整理用户可见变更及版本发布记录时。 |
 | 历史 | [早期方案归档](archive/early-plans.md) | 追溯已替代的设计方案。新需求在产品基线维护。 |
 
 ## 上游参考
@@ -18,7 +19,7 @@
 
 - 操作与素材。[第一次用教程](教程-第一次用.md)、[连续拍模式](连续拍模式.md)、[图库模板生成说明](图库模板生成说明.md)。
 - 开发与安全。[原版架构](../ARCHITECTURE.md)、[功能清单](../FEATURES.md)、[贡献指引](../CONTRIBUTING.md)、[安全说明](../SECURITY.md)。
-- 更新与版本。[更新日志与上游历史](../CHANGELOG.md)、[上游更新说明](../更新说明.md)。
+- 更新与版本。[上游更新日志](https://github.com/JerrIsTheBesta/AI-Short-Drama-Studio/blob/v0.1.38/CHANGELOG.md)、[上游更新说明](../更新说明.md)。
 
 ## Skill 维护目录
 

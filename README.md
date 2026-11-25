@@ -27,7 +27,7 @@ Dramlo 面向有本地模型或 ComfyUI 环境的创作者、希望自行部署�
 
 1. 拿到 `Dramlo-Web` Windows 构建包后，解压并运行 `start.cmd`，打开终端打印的本机地址。公开下载入口将在首个版本发布后补上。
 2. 打开「设置 → 外部 Agent 接入」，点「复制连接说明给 Agent」，把整段提示词发到你惯用的 Agent 平台。提示词带有当前工作台的连接参数。客户端需要支持加载 MCP，首次配置按客户端要求授权或启用连接。
-3. 确认连通后，直接告诉 Agent 你想怎么做。比如「读我导入的剧本，先拆第一场的分镜并写回画布，等我看完再开始生成」。
+3. 确认连通后，直接告诉 Agent 你想怎么做。比如「读我导入的剧本，先拆第一场的分镜并写回画布，等我看完再开始生成」。 [接入与排查](docs/studio-operation-manual.md#3-接入外部-agent)
 
 ## 画布
 
@@ -47,6 +47,10 @@ cargo build --release --locked --manifest-path dramlo-server/Cargo.toml
 ```
 
 运行 `npm run package:dramlo-web` 可构建 Windows 发布包，输出位于 `release-pack/`。
+
+## 项目文档
+
+[文档索引](docs/README.md) · [操作手册](docs/studio-operation-manual.md) · [更新日志](CHANGELOG.md)
 
 ## 许可证与致谢
 
