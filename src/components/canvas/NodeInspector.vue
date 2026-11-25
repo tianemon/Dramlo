@@ -1,0 +1,1754 @@
+<script setup lang="ts">
+import AppNumberInput from '@/components/common/AppNumberInput.vue'
+import AppMedia from '@/components/common/AppMedia.vue'
+import { confirmAction } from '@/composables/useAppConfirmation'
+import AppSelect from '@/components/common/AppSelect.vue'
+const externalTextOnly = Boolean(window.desktop?.isLocalWeb)
+import ServerImageTask from '@/components/canvas/ServerImageTask.vue'
+import HomeIcon from '@/components/common/HomeIcon.vue'
+import { computed, ref, watch } from 'vue'
+import { useProjectStore, useAssetsStore, useToastStore, useSettingsStore } from '@/stores'
+import { llmChoiceKey, llmModelGroups, parseLlmChoiceKey } from '@/stores/settings'
+import { runCanvasNode, runScriptNode, rewriteShotPerformance, optimizeShotVideoPrompt, optimizeFreeformVideoPrompt, isFl2vaChainActive, regenerateShotFrame } from '@/services/canvas/runner'
+import { isNodeRunning, isServerVideoRunning } from '@/services/canvas/jobs'
+import { prepareNativeShotVideos } from '@/services/canvas/prepareNativeVideo'
+import { desktop, isDesktop } from '@/services/desktop'
+import { assetAbsPath } from '@/services/storage'
+import { effectiveShotAudioMode, needsExternalTts, shotDisplayTitle } from '@/utils/shot'
+import { applyShotVideoModel, applyShotVideoProfile } from '@/services/canvas/videoModel'
+import { videoRequiresStoryboard } from '@/utils/storyboardGate'
+import { boundSubjectIds, collectShotRefIds, missingShotPropImages, propsForShot, sceneAssetForShot } from '@/utils/consistency'
+import { shotUsesFrames, stillModeForShot } from '@/utils/videoStill'
+import { needsPlayReview, PLAY_GATE_MSG } from '@/services/canvas/playGate'
+import { isPlayReady } from '@/services/ai'
+import { shotFrameSendPrompt } from '@/utils/nodePrompt'
+import { scriptFromImportedPlay } from '@/utils/scriptMarkdown'
+import { pickPlayMarkdownFile } from '@/utils/pickPlayFile'
+import { friendlyAiError, shouldToastAiError } from '@/services/ai/abort'
+import ImageModelSelect from '@/components/settings/ImageModelSelect.vue'
+import VideoModelSelect from '@/components/settings/VideoModelSelect.vue'
+import ImageResolutionSeg from '@/components/common/ImageResolutionSeg.vue'
+import VideoSettingsPopover from '@/components/canvas/VideoSettingsPopover.vue'
+import { pickDocImageResolution, pickDocVideoResolution, videoResolutionChoices, type DocImageResolution } from '@/services/ai/modelOptions'
+import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
+import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
+import TtsModelSelect from '@/components/settings/TtsModelSelect.vue'
+import GradientButton from '@/components/common/GradientButton.vue'
+import AspectRatioSeg from '@/components/common/AspectRatioSeg.vue'
+import AssetPicker from '@/components/common/AssetPicker.vue'
+import { openLightbox } from '@/composables/useLightbox'
+import { cssAspectRatio } from '@/services/canvas/layout'
+import { nextExtractStage, type ExtractStage } from '@/services/canvas/pipeline'
+import { canBuildExport } from '@/utils/timeline'
+import {
+  defaultPropSheetPrompt,
+  fillEmptyGeneratePrompt,
+  rebuildGeneratePrompt
+} from '@/utils/nodePrompt'
+import { VISUAL_STYLE_LABEL } from '@/utils/visualStyle'
+import { resolvedCanvasReferenceAssetIds } from '@/services/canvas/references'
+import ShotRefStrip from '@/components/canvas/ShotRefStrip.vue'
+import { normalizeH3GenMode, normalizeVideoGenModel, videoDurationOptions, videoMaxSeconds, videoMinSeconds, type AspectRatio, type CanvasNode, type H3VideoGenMode, type ID, type ShotAudioMode, type VideoGenModel, type VideoResolution, type VisualStyle } from '@/types'
+
+const props = defineProps<{
+  node: CanvasNode | null
+}>()
+
+const project = useProjectStore()
+const assets = useAssetsStore()
+const toast = useToastStore()
+const settings = useSettingsStore()
+const preview = ref('')
+const historyUrls = ref<Record<string, string>>({})
+const preparingVideo = ref(false)
+const running = computed(() => {
+  const node = props.node
+  return preparingVideo.value || Boolean(node && (
+    isNodeRunning(node.id) ||
+    (node.type === 'shotVideo' && isServerVideoRunning(project.current?.id, node.data.shotId)) ||
+    (node.type === 'videoGen' && isServerVideoRunning(project.current?.id, node.id))
+  ))
+})
+
+const continueHint = ref('')
+const pickerOpen = ref(false)
+const optimizingPrompt = ref(false)
+const keepAmbientAudio = computed({
+  get: () => project.current?.settings.keepAmbientAudio !== false,
+  set: (v: boolean) => project.setSettings({ keepAmbientAudio: v })
+})
+const ambientVolume = computed({
+  get: () => project.current?.settings.originalVolume ?? 0.55,
+  set: (v: number) => project.setSettings({ originalVolume: v })
+})
+const burnCaptions = computed({
+  get: () => project.current?.settings.burnCaptions !== false,
+  set: (v: boolean) => project.setSettings({ burnCaptions: v })
+})
+const isExportNode = computed(
+  () => props.node?.type === 'export' || props.node?.type === 'final'
+)
+
+const shot = computed(() => {
+  const id = props.node?.data.shotId
+  return project.current?.shots.find((s) => s.id === id)
+})
+const subject = computed(() => {
+  const id = props.node?.data.subjectId
+  return (project.current?.subjects ?? []).find((s) => s.id === id)
+})
+const propItem = computed(() => {
+  const id = props.node?.data.propId
+  return (project.current?.props ?? []).find((item) => item.id === id)
+})
+const scene = computed(() => {
+  const id = props.node?.data.sceneId
+  return (project.current?.scenes ?? []).find((s) => s.id === id)
+})
+
+const extraRefIds = computed({
+  get(): ID[] {
+    const t = props.node?.type
+    if (t === 'subject') return subject.value?.referenceAssetIds ?? []
+    if (t === 'prop') return propItem.value?.referenceAssetIds ?? []
+    if (t === 'sceneProps') return scene.value?.propReferenceAssetIds ?? []
+    if (t === 'scene') return scene.value?.referenceAssetIds ?? []
+    return []
+  },
+  set(ids: ID[]) {
+    const t = props.node?.type
+    if (t === 'subject' && subject.value) {
+      project.updateSubject(subject.value.id, { referenceAssetIds: ids })
+    } else if (t === 'prop' && propItem.value) {
+      project.updateProp(propItem.value.id, { referenceAssetIds: ids })
+    } else if (t === 'sceneProps' && scene.value) {
+      project.updateScene(scene.value.id, { propReferenceAssetIds: ids })
+    } else if (t === 'scene' && scene.value) {
+      project.updateScene(scene.value.id, { referenceAssetIds: ids })
+    }
+  }
+})
+
+const inspectorRefIds = computed(() => {
+  const p = project.current
+  const n = props.node
+  if (!p || !n || (n.type !== 'imageGen' && n.type !== 'videoGen')) return []
+  return resolvedCanvasReferenceAssetIds(p, n)
+})
+const inspectorRefUrls = ref<Record<string, string>>({})
+
+watch(
+  () => inspectorRefIds.value.join(','),
+  async () => {
+    const next: Record<string, string> = {}
+    for (const id of inspectorRefIds.value) {
+      next[id] = (await assets.getUrl(id)) || ''
+    }
+    inspectorRefUrls.value = next
+  },
+  { immediate: true }
+)
+
+function removeInspectorRef(id: ID) {
+  if (!props.node) return
+  project.removeCanvasNodeRef(props.node.id, id)
+  toast.success('已移除这张参考图')
+}
+
+const currentAssetId = computed(() => {
+  const t = props.node?.type
+  if (t === 'final') return project.current?.finalVideoAssetId
+  if (t === 'subject') return subject.value?.designSheetAssetId
+  if (t === 'prop') return propItem.value?.designSheetAssetId
+  if (t === 'sceneProps') return scene.value?.propSheetAssetId
+  if (t === 'scene') return scene.value?.plateAssetId
+  if (t === 'shotBoard') return shot.value?.boardAssetId
+  if (t === 'shotImage') return shot.value?.imageAssetId
+  if (t === 'shotFrames') return shot.value?.firstFrameAssetId || shot.value?.lastFrameAssetId
+  if (t === 'shotVideo') return shot.value?.videoAssetId
+  if (t === 'audio') return shot.value?.audioAssetId
+  if (t === 'imageGen' || t === 'videoGen') return props.node?.data.outputAssetId
+  return undefined
+})
+
+const hasAsset = computed(() => Boolean(currentAssetId.value))
+const waitingReview = computed(() => needsPlayReview(project.current))
+const gateBlocked = computed(() => {
+  const t = props.node?.type
+  return Boolean(
+    t &&
+      t !== 'script' &&
+      t !== 'export' &&
+      t !== 'final' &&
+      t !== 'imageGen' &&
+      t !== 'videoGen' &&
+      waitingReview.value
+  )
+})
+
+const actionLabel = computed(() => {
+  const t = props.node?.type
+  const again = hasAsset.value || Boolean(project.current?.finalVideoAssetId)
+  if (t === 'script') {
+    return isPlayReady(project.current?.script) ? '重新写剧本' : '写剧本'
+  }
+  if (t === 'subject') return again ? '重新生成四视图' : '生成四视图'
+  if (t === 'prop') return again ? '重新生成多角度图' : '生成多角度图'
+  if (t === 'sceneProps') return again ? '重新生成关键道具图' : '生成关键道具图'
+  if (t === 'scene') return again ? '重新生成锚点图' : '生成锚点图'
+  if (t === 'shotBoard') return again ? '重新生成故事看板' : '生成故事看板'
+  if (t === 'shotImage') {
+    return again
+      ? videoRequiresStoryboard(project.current)
+        ? '重新生成配图'
+        : '重新生成四宫格'
+      : videoRequiresStoryboard(project.current)
+        ? '生成配图'
+        : '生成四宫格'
+  }
+  if (t === 'shotFrames') return again ? '重画首尾帧' : '画首尾帧'
+  if (t === 'shotVideo') return again ? '重新生成视频' : '生成视频'
+  if (t === 'audio') {
+    if (!shot.value || !needsExternalTts(shot.value, project.current)) return '无需独立配音'
+    return again ? '重新生成口播' : '生成口播'
+  }
+  if (t === 'export' || t === 'final') return again ? '重新合成视频' : '合成视频'
+  return again ? '重新生成' : '生成这个节点'
+})
+
+const extractLabel = computed(() => {
+  const stage = nextExtractStage(project.current)
+  if (stage === 'subjects') return '第 1 步：提炼人物'
+  if (stage === 'scenes') return '第 2 步：提炼场景'
+  if (stage === 'shots') return '第 3 步：拆分镜'
+  return ''
+})
+const canExtractNext = computed(() => Boolean(nextExtractStage(project.current)))
+const isImg2Video = computed(() => project.current?.pipelineMode === 'img2video')
+const canExtractShots = computed(
+  () => Boolean((project.current?.subjects ?? []).length && (project.current?.scenes ?? []).length)
+)
+
+const isImageNode = computed(() => {
+  const t = props.node?.type
+  return (
+    t === 'subject' ||
+    t === 'sceneProps' ||
+    t === 'scene' ||
+    t === 'shotBoard' ||
+    t === 'shotImage' ||
+    t === 'shotFrames'
+  )
+})
+const canPickAsset = computed(() => isImageNode.value || props.node?.type === 'imageGen')
+const isVideoNode = computed(() => props.node?.type === 'shotVideo' || props.node?.type === 'videoGen')
+
+/** 本镜说话角色的音色：人物卡上的实时值优先，其次用提炼时绑定的快照 */
+const shotSpeakerVoice = computed(() => {
+  const s = shot.value
+  if (!s) return ''
+  const label = String(s.voiceover || '').match(/^([^：:\n]{1,12})[：:]/)?.[1]?.trim()
+  const subs = project.current?.subjects ?? []
+  const hit = label
+    ? subs.find((x) => x.name.trim() === label) ??
+      subs.find((x) => {
+        const n = x.name.trim()
+        return n && (label.includes(n) || n.includes(label))
+      })
+    : undefined
+  return hit?.voicePrompt?.trim() || s.speakerVoice || ''
+})
+const shotSpeakerName = computed(() => {
+  const s = shot.value
+  if (!s) return ''
+  return String(s.voiceover || '').match(/^([^：:\n]{1,12})[：:]/)?.[1]?.trim() || ''
+})
+
+const showAspect = computed(() => {
+  const t = props.node?.type
+  return (
+    t === 'script' ||
+    t === 'shotBoard' ||
+    t === 'shotImage' ||
+    t === 'shotVideo' ||
+    t === 'imageGen' ||
+    t === 'videoGen'
+  )
+})
+const nodeAspectRatio = computed({
+  get: () => props.node?.data.aspectRatio ?? project.current?.settings.aspectRatio ?? '16:9',
+  set: (v: AspectRatio) => {
+    const node = props.node
+    if (!node) return
+    if (node.type === 'script') {
+      project.setAspectRatio(v)
+      return
+    }
+    project.patchCanvasNode(node.id, {
+      aspectRatio: v,
+      ...(node.type === 'imageGen' || node.type === 'videoGen'
+        ? { outputAssetId: undefined, videoTaskId: undefined }
+        : {})
+    })
+    if (node.type === 'shotVideo' && shot.value) project.invalidateShotAssets(shot.value.id, 'video')
+    else if ((node.type === 'shotImage' || node.type === 'shotBoard') && shot.value) {
+      project.invalidateShotAssets(shot.value.id, 'image')
+    }
+  }
+})
+
+const videoModel = computed({
+  get: () => normalizeVideoGenModel(props.node?.data.videoModel),
+  set: (v: VideoGenModel) => {
+    if (!props.node) return
+    applyShotVideoModel(props.node.id, v)
+  }
+})
+function onSelectVideoProfile(profileId: string) {
+  if (props.node) applyShotVideoProfile(props.node.id, profileId)
+}
+const resolutionChoices = computed(() =>
+  videoResolutionChoices({
+    model: videoModel.value,
+    profile: videoModel.value === 'wan-prime' ? null : docVideoProfile.value
+  })
+)
+const videoResolution = computed({
+  get: () => {
+    const choices = resolutionChoices.value
+    if (choices.length) return pickDocVideoResolution(props.node?.data.videoResolution ?? project.current?.settings.defaultVideoResolution, choices) || choices[0]
+    return '768p' as VideoResolution
+  },
+  set: (v: VideoResolution) => {
+    if (props.node) project.patchCanvasNode(props.node.id, { videoResolution: v })
+  }
+})
+const explicitVideoProfileId = computed(() => shot.value
+  ? shot.value.videoProfileId : props.node?.data.videoProfileId)
+const docVideoProfile = computed(() => {
+  const id = explicitVideoProfileId.value || settings.config.activeVideoId
+  return settings.config.videos.find((item) => item.id === id)
+})
+const imageResolutionChoices = computed(
+  () =>
+    settings.config.images.find((item) => item.id === settings.config.activeImageId)?.options?.imageResolutions ||
+    []
+)
+const imageResolution = computed({
+  get: () => pickDocImageResolution(props.node?.data.imageResolution, imageResolutionChoices.value) || '2k',
+  set: (v: DocImageResolution) => {
+    if (props.node) project.patchCanvasNode(props.node.id, { imageResolution: v })
+  }
+})
+const inspectorDurations = computed(() => videoDurationOptions(videoModel.value))
+const inspectorDuration = computed({
+  get() {
+    const opts = inspectorDurations.value
+    const raw = Math.round(
+      Number(props.node?.type === 'shotVideo' ? shot.value?.duration : props.node?.data.duration) || opts[0] || 5
+    )
+    if (opts.includes(raw)) return raw
+    return opts.reduce((best, item) => (Math.abs(item - raw) < Math.abs(best - raw) ? item : best), opts[0] || raw)
+  },
+  set(v: number) {
+    if (!props.node) return
+    if (props.node.type === 'shotVideo' && shot.value) {
+      project.updateShot(shot.value.id, { duration: v })
+      return
+    }
+    project.patchCanvasNode(props.node.id, { duration: v })
+  }
+})
+const showVideoAudio = computed(() => docVideoProfile.value?.options?.videoAudio === true)
+const lastFrameRequired = computed(() => docVideoProfile.value?.options?.lastFrameRequired === true)
+const generateAudio = computed({
+  get: () => Boolean(props.node?.data.generateAudio),
+  set: (v: boolean) => {
+    if (props.node) project.patchCanvasNode(props.node.id, { generateAudio: v })
+  }
+})
+const isH3Video = computed(
+  () =>
+    (props.node?.type === 'shotVideo' || props.node?.type === 'videoGen') &&
+    videoModel.value !== 'wan-prime'
+)
+const missingProps = computed(() => shot.value && project.current ? missingShotPropImages(shot.value, project.current) : [])
+const frameInputEnabled = computed(() => shot.value ? shotUsesFrames(shot.value, project.current) : false)
+
+function applyShotAudioMode(mode: ShotAudioMode) {
+  if (!shot.value) return
+  project.updateShot(shot.value.id, { audioMode: mode })
+  project.syncCanvasFromProject()
+}
+
+const savingBindings = ref(false)
+const bindingFormRevision = ref(0)
+const boundPeople = computed(() => shot.value && project.current ? boundSubjectIds(shot.value, project.current.subjects ?? []) : [])
+const boundProps = computed(() => shot.value && project.current ? propsForShot(shot.value, project.current).map(item => item.id) : [])
+const boundScene = computed(() => shot.value && project.current ? sceneAssetForShot(shot.value, project.current)?.id : undefined)
+
+async function editBinding(action: (shotId: ID) => Promise<void>) {
+  if (!shot.value || savingBindings.value) return
+  savingBindings.value = true
+  try {
+    await action(shot.value.id)
+  } catch (error) {
+    bindingFormRevision.value++
+    toast.error(error instanceof Error ? error.message : '未能保存镜头绑定')
+  } finally {
+    savingBindings.value = false
+  }
+}
+
+function applySubjectBinding(mode: 'infer' | 'explicit') {
+  void editBinding(id => project.saveShotBindings(id, {
+    subjectBindingMode: mode, ...(mode === 'explicit' ? { subjectIds: boundPeople.value } : {})
+  }))
+}
+
+function toggleBinding(kind: 'subject' | 'prop', id: ID, enabled: boolean) {
+  void editBinding(shotId => project.changeShotBinding(shotId, kind, id, enabled))
+}
+
+const h3GenMode = computed({
+  get: () =>
+    props.node?.type === 'videoGen'
+      ? normalizeH3GenMode(props.node.data.h3GenMode)
+      : normalizeH3GenMode(shot.value?.h3GenMode),
+  set: (v: H3VideoGenMode) => {
+    if (props.node?.type === 'videoGen') {
+      project.patchCanvasNode(props.node.id, { h3GenMode: v })
+    } else if (shot.value) {
+      project.updateShot(shot.value.id, { h3GenMode: v })
+    }
+  }
+})
+const firstFrameId = computed({
+  get: () =>
+    props.node?.type === 'videoGen'
+      ? props.node.data.firstFrameAssetId
+      : shot.value?.firstFrameAssetId,
+  set: (v: ID | undefined) => {
+    if (props.node?.type === 'videoGen') {
+      project.patchCanvasNode(props.node.id, { firstFrameAssetId: v })
+    } else if (shot.value) {
+      project.updateShot(shot.value.id, { firstFrameAssetId: v })
+    }
+  }
+})
+const lastFrameId = computed({
+  get: () =>
+    props.node?.type === 'videoGen'
+      ? props.node.data.lastFrameAssetId
+      : shot.value?.lastFrameAssetId,
+  set: (v: ID | undefined) => {
+    if (props.node?.type === 'videoGen') {
+      project.patchCanvasNode(props.node.id, { lastFrameAssetId: v })
+    } else if (shot.value) {
+      project.updateShot(shot.value.id, { lastFrameAssetId: v })
+    }
+  }
+})
+const isH3Fl2va = computed(() => isH3Video.value && h3GenMode.value === 'fl2va')
+/** 项目级「首尾帧链」：整条片按镜号首尾相接，不需要逐镜手动选帧 */
+const fl2vaChain = computed(() => isH3Video.value && isFl2vaChainActive(project.current))
+
+/** 首尾帧节点：两张帧各自的画面词 */
+const startFramePromptValue = computed(() => {
+  const s = shot.value
+  if (!s || !project.current) return ''
+  return s.firstFramePrompt?.trim() || shotFrameSendPrompt(s, project.current, 'start')
+})
+const endFramePromptValue = computed(() => {
+  const s = shot.value
+  if (!s || !project.current) return ''
+  return s.lastFramePrompt?.trim() || shotFrameSendPrompt(s, project.current, 'end')
+})
+async function redrawFrame(which: 'start' | 'end') {
+  const s = shot.value
+  if (!s || running.value) return
+  try {
+    await regenerateShotFrame(s, which, (msg) => toast.info(msg))
+    toast.success(which === 'start' ? '起始帧已重画' : '结束帧已重画')
+  } catch (e: any) {
+    toast.error(friendlyAiError(e) || '重画失败')
+  }
+}
+
+const canRun = computed(() => {
+  if (running.value || gateBlocked.value) return false
+  if (props.node?.type === 'export' || props.node?.type === 'final') {
+    return canBuildExport(project.current)
+  }
+  if (props.node?.type === 'audio' && shot.value && !needsExternalTts(shot.value, project.current)) return false
+  return true
+})
+
+const previewAspect = computed(() => {
+  if (props.node?.type === 'subject' || props.node?.type === 'prop' || props.node?.type === 'sceneProps' || props.node?.type === 'scene') {
+    return cssAspectRatio('16:9')
+  }
+  return cssAspectRatio(nodeAspectRatio.value)
+})
+
+const kindLabel = computed(() => {
+  const t = props.node?.type
+  if (t === 'script') return '完整剧本'
+  if (t === 'subject') return '人物 · 四视图'
+  if (t === 'prop') return '道具 · 多角度'
+  if (t === 'sceneProps') return '场景 · 关键道具图'
+  if (t === 'scene') return '场景 · 锚点图'
+  if (t === 'shotBoard') return '分镜 · 故事看板'
+  if (t === 'shotImage') return videoRequiresStoryboard(project.current) ? '分镜 · 配图' : '分镜 · 四宫格关键帧'
+  if (t === 'shotFrames') return '分镜 · 首尾帧'
+  if (t === 'shotVideo') {
+    const d = shot.value?.duration
+    return d ? `分镜 · 视频 · ${d}s` : '分镜 · 视频'
+  }
+  if (t === 'audio') return '分镜 · 口播'
+  if (t === 'export') return '视频 · 合成'
+  if (t === 'final') return '视频 · 预览'
+  if (t === 'imageGen') return '图片生成'
+  if (t === 'videoGen') return '图生视频'
+  return t || ''
+})
+
+const title = computed(() => {
+  if (!props.node) return '未选择'
+  if (props.node.type === 'script') return project.current?.script?.topic || '文案'
+  if (subject.value) return subject.value.name
+  if (propItem.value) return propItem.value.name
+  if (scene.value) return scene.value.name
+  if (shot.value) return props.node?.data.label || shotDisplayTitle(shot.value)
+  if (props.node.type === 'export') return '合成视频'
+  if (props.node.type === 'final') return '视频预览'
+  return props.node.data.label || props.node.type
+})
+
+const historyIds = computed(() => {
+  const t = props.node?.type
+  if (t === 'subject') return subject.value?.designSheetHistoryIds ?? []
+  if (t === 'sceneProps') return scene.value?.propSheetHistoryIds ?? []
+  if (t === 'scene') return scene.value?.plateHistoryIds ?? []
+  if (t === 'shotBoard') return shot.value?.boardHistoryIds ?? []
+  if (t === 'shotImage') return shot.value?.imageHistoryIds ?? []
+  if (t === 'shotVideo') return shot.value?.videoHistoryIds ?? []
+  return []
+})
+
+const videoPromptPlaceholder = computed(() =>
+  '这里完全由你编辑。清空后不会回填；可自己填写，或主动点“优化提示词 / 按分镜重铺”。'
+)
+
+watch(
+  [
+    () => props.node?.id,
+    () => props.node?.type,
+    () => subject.value?.id,
+    () => propItem.value?.id,
+    () => scene.value?.id,
+    () => shot.value?.id
+  ],
+  () => {
+    const p = project.current
+    const node = props.node
+    if (!p || !node) return
+    const t = node.type
+    if (t === 'subject' && subject.value) {
+      const patch = fillEmptyGeneratePrompt('subject', p, subject.value)
+      if (patch) project.updateSubject(subject.value.id, patch)
+    } else if (t === 'prop' && propItem.value && propItem.value.sheetPrompt == null) {
+      project.updateProp(propItem.value.id, { sheetPrompt: defaultPropSheetPrompt(propItem.value, p) })
+    } else if (t === 'scene' && scene.value) {
+      const patch = fillEmptyGeneratePrompt('scene', p, scene.value)
+      if (patch) project.updateScene(scene.value.id, patch)
+    } else if (t === 'sceneProps' && scene.value) {
+      const patch = fillEmptyGeneratePrompt('sceneProps', p, scene.value)
+      if (patch) project.updateScene(scene.value.id, patch)
+    } else if (t === 'shotBoard' && shot.value) {
+      const patch = fillEmptyGeneratePrompt('shotBoard', p, shot.value)
+      if (patch) project.updateShot(shot.value.id, patch)
+    } else if (t === 'shotImage' && shot.value) {
+      const patch = fillEmptyGeneratePrompt('shotImage', p, shot.value)
+      if (patch) project.updateShot(shot.value.id, patch)
+    }
+  },
+  { immediate: true }
+)
+
+async function refreshPreview() {
+  preview.value = ''
+  const id = currentAssetId.value
+  if (!id || !props.node) return
+  const nodeId = props.node.id
+  const projectId = project.current?.id
+  const url = (await assets.getUrl(id)) || ''
+  if (props.node?.id === nodeId && currentAssetId.value === id && project.current?.id === projectId) {
+    preview.value = url
+  }
+}
+
+const priorTakeChanged = computed(() => {
+  const assetId = currentAssetId.value
+  if (!assetId) return false
+  const source = assets.getMeta(assetId)?.videoGeneration
+  if (!source?.previousShotId || !source.previousAssetId) return false
+  const previous = project.current?.shots.find((item) => item.id === source.previousShotId)
+  return previous?.videoAssetId !== source.previousAssetId
+})
+
+async function locateVideo(mode: 'open' | 'copy') {
+  const id = currentAssetId.value
+  if (!id) return
+  try {
+    const path = await assetAbsPath(id)
+    if (!path) throw new Error('本地原片已移动或丢失')
+    if (mode === 'copy') {
+      await navigator.clipboard.writeText(path)
+      toast.success('已复制本地路径')
+    } else {
+      const directory = path.replace(/[\\/][^\\/]+$/, '')
+      const error = await desktop().openPath(directory)
+      if (error) throw new Error(error)
+    }
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '无法定位本地原片')
+  }
+}
+
+async function loadHistory() {
+  const ids = historyIds.value
+  const next: Record<string, string> = {}
+  for (const id of ids) {
+    const url =
+      props.node?.type === 'shotVideo'
+        ? (await assets.ensureThumb(id)) || (await assets.getUrl(id))
+        : await assets.getUrl(id)
+    if (url) next[id] = url
+  }
+  historyUrls.value = next
+}
+
+async function restoreHistory(assetId: string) {
+  if (!props.node) return
+  project.assignCanvasNodeAsset(props.node.id, assetId)
+  await project.save()
+  await refreshPreview()
+  await loadHistory()
+  toast.success('已切回这个版本')
+}
+
+async function onPickerConfirm(ids: ID[]) {
+  pickerOpen.value = false
+  const id = ids[0]
+  if (!id || !props.node) return
+  try {
+    const asset = await assets.adopt(id, 'image', {
+      projectId: project.current?.id,
+      shotId: props.node.data.shotId
+    })
+    project.assignCanvasNodeAsset(props.node.id, asset.id)
+    await project.save()
+    await refreshPreview()
+    await loadHistory()
+    toast.success('已选用该图片')
+  } catch (e: any) {
+    toast.error(e?.message || '选用失败')
+  }
+}
+
+async function downloadFinal() {
+  const id = project.current?.finalVideoAssetId
+  if (!id) {
+    toast.warn('还没有合成视频，请先合成')
+    return
+  }
+  const blob = await assets.getBlob(id)
+  if (!blob) {
+    toast.error('视频文件读取失败')
+    return
+  }
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${project.current?.name ?? 'final'}.mp4`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+async function run() {
+  const node = props.node
+  if (!node || preparingVideo.value) return
+  if (gateBlocked.value) {
+    toast.warn(PLAY_GATE_MSG)
+    return
+  }
+  try {
+    if (node.type === 'script') {
+      await runScriptNode('play', undefined, undefined, llmModel.value)
+    } else {
+      if (node.type === 'shotVideo' && shot.value && !node.data.captureId) {
+        preparingVideo.value = true
+        try {
+          if (await prepareNativeShotVideos([shot.value])) {
+            toast.info('镜头已预检，请在视频状态栏展开并确认开始')
+            return
+          }
+        } finally {
+          preparingVideo.value = false
+        }
+      }
+      await runCanvasNode(node.id)
+    }
+    await refreshPreview()
+    await loadHistory()
+    toast.success(actionLabel.value + '完成')
+  } catch (e: any) {
+    if (shouldToastAiError(e)) toast.error(friendlyAiError(e) || '生成失败')
+  }
+}
+
+async function runContinue() {
+  if (!props.node) return
+  try {
+    await runScriptNode('continue', undefined, undefined, llmModel.value, continueHint.value)
+    toast.success('已续写剧本')
+  } catch (e: any) {
+    if (shouldToastAiError(e)) toast.error(friendlyAiError(e) || '续写失败')
+  }
+}
+
+async function runExtract(stage?: ExtractStage) {
+  if (!props.node) return
+  if (stage === 'shots' && !canExtractShots.value) {
+    toast.warn('请先提炼角色和场景，再拆分镜')
+    return
+  }
+  try {
+    await runScriptNode('extract', undefined, undefined, llmModel.value, undefined, stage)
+    toast.success(
+      stage === 'subjects'
+        ? '角色已提炼到画布'
+        : stage === 'scenes'
+          ? '场景已提炼到画布'
+          : stage === 'shots'
+            ? '分镜已提炼到画布'
+            : '节点已从剧本提炼出来'
+    )
+  } catch (e: any) {
+    if (shouldToastAiError(e)) toast.error(friendlyAiError(e) || '提炼失败')
+  }
+}
+
+watch(
+  () => [props.node?.id, currentAssetId.value] as const,
+  () => {
+    refreshPreview()
+    loadHistory()
+  }
+)
+
+watch(running, (now, was) => {
+  if (was && !now) {
+    refreshPreview()
+    loadHistory()
+  }
+})
+
+const llmGroups = computed(() => llmModelGroups(settings.config.llms ?? []))
+const llmChoice = computed({
+  get() {
+    const id = settings.config.activeLlmId
+    const model = settings.config.llm.model
+    return id && model ? llmChoiceKey(id, model) : ''
+  },
+  set(v: string) {
+    const parsed = parseLlmChoiceKey(v)
+    if (parsed) settings.selectLlmModel(parsed.profileId, parsed.model)
+  }
+})
+const llmModel = computed(() => settings.config.llm.model)
+
+function patchScript(field: 'topic' | 'content', value: string) {
+  if (!project.current?.script) return
+  project.setScript({ ...project.current.script, [field]: value })
+  if (field === 'topic') project.applyPlayTitle(value)
+}
+
+async function importPlayMarkdown() {
+  if (!project.current) return
+  const existing = (project.current.script?.content || '').trim()
+  if (existing && !await confirmAction('导入会替换当前剧本正文，确定吗？')) return
+  try {
+    const picked = await pickPlayMarkdownFile()
+    if (!picked) return
+    const script = scriptFromImportedPlay(project.current, picked.text, picked.filename)
+    project.setScript(script)
+    project.applyPlayTitle(script.topic)
+    if (project.current.pipelineMode !== 'img2video') project.setPlayApproved(false)
+    await project.save()
+    toast.success(`已导入「${script.topic}」`)
+  } catch (e: any) {
+    toast.error(e?.message || '导入失败')
+  }
+}
+
+const styleOptions = Object.entries(VISUAL_STYLE_LABEL) as [VisualStyle, string][]
+const projectStyle = computed({
+  get: () => project.current?.script?.style ?? 'cinematic',
+  set: (style: VisualStyle) => {
+    if (!project.current?.script) return
+    project.setScript({ ...project.current.script, style })
+  }
+})
+
+function rebuildPrompt() {
+  const p = project.current
+  const node = props.node
+  if (!p || !node) return
+  const t = node.type
+  if (t === 'subject' && subject.value) {
+    project.updateSubject(subject.value.id, rebuildGeneratePrompt('subject', p, subject.value))
+  } else if (t === 'prop' && propItem.value) {
+    project.updateProp(propItem.value.id, { sheetPrompt: defaultPropSheetPrompt(propItem.value, p) })
+  } else if (t === 'scene' && scene.value) {
+    project.updateScene(scene.value.id, rebuildGeneratePrompt('scene', p, scene.value))
+  } else if (t === 'sceneProps' && scene.value) {
+    project.updateScene(scene.value.id, rebuildGeneratePrompt('sceneProps', p, scene.value))
+  } else if (t === 'shotBoard' && shot.value) {
+    project.updateShot(shot.value.id, rebuildGeneratePrompt('shotBoard', p, shot.value))
+  } else if (t === 'shotImage' && shot.value) {
+    project.updateShot(shot.value.id, rebuildGeneratePrompt('shotImage', p, shot.value))
+  } else if (t === 'shotVideo' && shot.value) {
+    project.updateShot(shot.value.id, rebuildGeneratePrompt('shotVideo', p, shot.value))
+  } else {
+    return
+  }
+  toast.success('已按当前画风重铺提示词。再点生成才会出新图。')
+}
+
+async function resetVideoPrompt() {
+  if (!shot.value) return
+  try {
+    await rewriteShotPerformance(shot.value)
+    toast.success('已按本镜剧情重写')
+  } catch (e: any) {
+    toast.error(friendlyAiError(e) || '重写失败')
+  }
+}
+
+async function optimizeVideoPrompt() {
+  if (optimizingPrompt.value) return
+  optimizingPrompt.value = true
+  try {
+    if (props.node?.type === 'videoGen') {
+      await optimizeFreeformVideoPrompt(props.node.id)
+    } else if (shot.value) {
+      await optimizeShotVideoPrompt(shot.value)
+    } else {
+      return
+    }
+    toast.success('已优化提示词')
+  } catch (e: any) {
+    toast.error(friendlyAiError(e) || '优化失败')
+  } finally {
+    optimizingPrompt.value = false
+  }
+}
+</script>
+
+<template>
+  <aside class="insp">
+    <ServerImageTask v-if="isDesktop() && node?.type === 'scene' && scene"
+      :key="scene.id" target-type="scene" :target-id="scene.id" :saved-prompt="scene.platePrompt" />
+    <ServerImageTask v-if="isDesktop() && node?.type === 'shotImage' && shot"
+      :key="shot.id" target-type="shot-image" :target-id="shot.id" :saved-prompt="shot.imagePrompt || shot.visualPrompt"
+      :suggested-reference-ids="project.current ? collectShotRefIds(shot, project.current).ids : []" />
+    <div v-if="!node" class="empty">点画布上的节点，这里改提示词、单独重新生成</div>
+    <template v-else>
+      <div class="insp-k">{{ kindLabel }}</div>
+      <h3>{{ title }}</h3>
+      <p v-if="node.error" class="err">{{ node.error }}</p>
+      <p v-else-if="hasAsset && node.type === 'audio'" class="hint">
+        点播放可试听口播。改文案后重新生成，只动这一个节点。
+      </p>
+      <p v-else-if="hasAsset && node.type !== 'script' && node.type !== 'export' && node.type !== 'final'" class="hint">
+        改下面提示词后点重新生成，只动这一个节点。也可以从资源库选用已有图。点缩略图可看大图。
+      </p>
+      <p v-else-if="canPickAsset" class="hint">
+        可以生成，也可以从资源库选用已有图片，不必临时出图。
+      </p>
+
+      <p v-else-if="node.type === 'script'" class="hint">
+        {{
+          isImg2Video
+            ? '可导入 .md 剧本，或先写完整剧本，再点提炼角色、场景或分镜。也可以右键直接加空白节点。'
+            : '可导入 .md 剧本。或先写完整剧本（背景、人物、环境、分场都要写清，还不拆节点），再提炼人物、场景、分镜。'
+        }}
+      </p>
+      <p v-else-if="node.type === 'export'" class="hint">
+        先调下方音频与字幕，再点合成。视频会出现在「视频预览」节点。
+      </p>
+      <p v-else-if="node.type === 'final'" class="hint">
+        可预览/下载视频。改音频设置后点重新合成即可。
+      </p>
+      <p v-else-if="gateBlocked" class="hint">{{ PLAY_GATE_MSG }}</p>
+
+      <AspectRatioSeg v-if="showAspect" v-model="nodeAspectRatio" />
+
+      <div v-if="isDesktop() && currentAssetId && (node.type === 'shotVideo' || node.type === 'final')" class="native-video-actions">
+        <button type="button" @click="locateVideo('open')">打开所在文件夹</button>
+        <button type="button" @click="locateVideo('copy')">复制本地路径</button>
+        <p v-if="!preview">暂无可播放的本地预览，可以重新定位原片。</p>
+        <p v-if="priorTakeChanged">上一镜已更换选片，请复核本镜的接续。</p>
+      </div>
+      <div v-if="preview && (node.type === 'shotVideo' || node.type === 'final')" class="prev prev-video">
+        <div class="prev-frame" :style="{ aspectRatio: previewAspect }">
+          <AppMedia :src="preview" playsinline preload="auto" />
+        </div>
+      </div>
+      <div v-else-if="preview && node.type === 'audio'" class="prev prev-audio">
+        <AppMedia kind="audio" :src="preview" preload="auto" />
+        <span>试听口播</span>
+      </div>
+      <button
+        v-else-if="preview"
+        class="prev"
+        type="button"
+        title="点击查看大图"
+        @click="openLightbox(preview, 'image', title)"
+      >
+        <div class="prev-frame" :style="{ aspectRatio: previewAspect }">
+          <img :src="preview" alt="" />
+        </div>
+        <span>查看大图</span>
+      </button>
+
+      <template v-if="isExportNode && project.current">
+        <label>字幕</label>
+        <label class="check">
+          <input v-model="burnCaptions" type="checkbox" />
+          <span>烧录字幕到画面</span>
+        </label>
+
+        <label>分镜原声（环境音）</label>
+        <div class="seg">
+          <button
+            type="button"
+            class="seg-btn"
+            :class="{ on: keepAmbientAudio }"
+            @click="keepAmbientAudio = true"
+          >
+            保留
+          </button>
+          <button
+            type="button"
+            class="seg-btn"
+            :class="{ on: !keepAmbientAudio }"
+            @click="keepAmbientAudio = false"
+          >
+            去掉
+          </button>
+        </div>
+        <p class="hint">
+          {{
+            keepAmbientAudio
+              ? '保留普通镜头环境音；H3 自带对白 / 口播始终保留。'
+              : '静音 TTS / 无口播镜头原声；H3 自带人声不受影响。'
+          }}
+        </p>
+        <div v-if="keepAmbientAudio" class="vol-row">
+          <span class="hint">环境音</span>
+          <input v-model.number="ambientVolume" type="range" min="0.1" max="1" step="0.05" />
+          <span class="hint">{{ Math.round(ambientVolume * 100) }}%</span>
+        </div>
+      </template>
+
+      <template v-if="node.type === 'script' && project.current">
+        <label>主题</label>
+        <input
+          :value="project.current.script?.topic"
+          @input="patchScript('topic', ($event.target as HTMLInputElement).value)"
+        />
+        <label>文案（Markdown，可用 # 大标题 ## 小标题）</label>
+        <div class="lab-row">
+          <p class="hint">可导入 .md / .markdown / .txt。</p>
+          <button class="link" type="button" @click="importPlayMarkdown">导入 Markdown</button>
+        </div>
+        <textarea
+          rows="12"
+          :value="project.current.script?.content"
+          @input="patchScript('content', ($event.target as HTMLTextAreaElement).value)"
+        />
+        <GradientButton
+          v-if="waitingReview"
+          block
+          type="secondary"
+          @click="project.setPlayApproved(true)"
+        >
+          确认通过，往下做人设
+        </GradientButton>
+        <label>画面风格</label>
+        <AppSelect v-model="projectStyle">
+          <option v-for="[id, name] in styleOptions" :key="id" :value="id">{{ name }}</option>
+        </AppSelect>
+        <p class="hint">这是项目默认画风。各节点上已经展开的提示词不会自动改；换完到人物/场景/分镜点「按这个画风重铺」。</p>
+        <label>写剧本用的 LLM</label>
+        <AppSelect v-model="llmChoice">
+          <option v-if="!llmGroups.some((g) => g.models.length)" value="">请先在设置里添加模型</option>
+          <optgroup v-for="g in llmGroups" :key="g.id" :label="g.name">
+            <option v-for="m in g.models" :key="`${g.id}::${m}`" :value="`${g.id}::${m}`">{{ m }}</option>
+          </optgroup>
+        </AppSelect>
+      </template>
+
+      <template v-else-if="node.type === 'prop' && propItem">
+        <label>实际出图提示词</label>
+        <div class="lab-row">
+          <p class="hint">纯白背景，正面、侧面、背面、细节。框里是什么就发什么。</p>
+          <button class="link" type="button" @click="rebuildPrompt">按这个画风重铺</button>
+        </div>
+        <textarea
+          rows="12"
+          :value="propItem.sheetPrompt ?? ''"
+          placeholder="同一件道具的多角度图。形状、材质、颜色。改完点重新生成。"
+          @input="project.updateProp(propItem.id, { sheetPrompt: ($event.target as HTMLTextAreaElement).value })"
+        />
+        <label>道具名</label>
+        <input
+          :value="propItem.name"
+          @change="project.updateProp(propItem.id, { name: ($event.target as HTMLInputElement).value.trim() || propItem.name })"
+        />
+      </template>
+
+      <template v-else-if="node.type === 'subject' && subject">
+        <label>实际出图提示词</label>
+        <div class="lab-row">
+          <p class="hint">框里是什么就发什么。换风格：改画风那几句，或先在剧本节点改画面风格，再点重铺。</p>
+          <button class="link" type="button" @click="rebuildPrompt">按这个画风重铺</button>
+        </div>
+        <textarea
+          rows="16"
+          :value="subject.sheetPrompt ?? ''"
+          placeholder="纯白背景四视图。外貌、服装、画风。改完点重新生成。"
+          @input="project.updateSubject(subject.id, { sheetPrompt: ($event.target as HTMLTextAreaElement).value })"
+        />
+      </template>
+
+      <template v-else-if="node.type === 'sceneProps' && scene">
+        <label>实际出图提示词</label>
+        <div class="lab-row">
+          <p class="hint">框里是什么就发什么。</p>
+          <button class="link" type="button" @click="rebuildPrompt">按这个画风重铺</button>
+        </div>
+        <textarea
+          rows="16"
+          :value="scene.propSheetPrompt ?? ''"
+          placeholder="关键道具怎么画。改完点重新生成。"
+          @input="project.updateScene(scene.id, { propSheetPrompt: ($event.target as HTMLTextAreaElement).value })"
+        />
+      </template>
+
+      <template v-else-if="node.type === 'scene' && scene">
+        <label>实际出图提示词</label>
+        <div class="lab-row">
+          <p class="hint">框里是什么就发什么。</p>
+          <button class="link" type="button" @click="rebuildPrompt">按这个画风重铺</button>
+        </div>
+        <textarea
+          rows="16"
+          :value="scene.platePrompt ?? ''"
+          placeholder="这个地点的四宫格锚点图怎么画。"
+          @input="project.updateScene(scene.id, { platePrompt: ($event.target as HTMLTextAreaElement).value })"
+        />
+        <label>地点描述</label>
+        <textarea
+          rows="4"
+          :value="scene.description"
+          placeholder="人还没进来时这个地方：地面、光、门窗、材质。"
+          @input="project.updateScene(scene.id, { description: ($event.target as HTMLTextAreaElement).value })"
+        />
+        <label>主锚</label>
+        <input
+          :value="scene.mainAnchor || ''"
+          placeholder="电梯门、接待台、锅灶……摄像能对着的实物"
+          @change="project.updateScene(scene.id, { mainAnchor: ($event.target as HTMLInputElement).value })"
+        />
+        <label>四宫格锚点</label>
+        <textarea
+          rows="3"
+          :value="scene.anchors || ''"
+          placeholder="全景；主锚；地面站位；光源或次锚"
+          @input="project.updateScene(scene.id, { anchors: ($event.target as HTMLTextAreaElement).value })"
+        />
+      </template>
+
+      <template v-else-if="node.type === 'shotBoard' && shot">
+        <label>实际出图提示词</label>
+        <div class="lab-row">
+          <p class="hint">框里是什么就发什么。</p>
+          <button class="link" type="button" @click="rebuildPrompt">按这个画风重铺</button>
+        </div>
+        <textarea
+          rows="16"
+          :value="shot.boardPrompt ?? ''"
+          placeholder="故事看板怎么画。改完点生成。"
+          @input="project.updateShot(shot.id, { boardPrompt: ($event.target as HTMLTextAreaElement).value })"
+        />
+      </template>
+
+      <template v-else-if="node.type === 'shotImage' && shot">
+        <div class="lab-row">
+          <label>实际出图提示词</label>
+          <button class="link" type="button" @click="rebuildPrompt">按这个画风重铺</button>
+        </div>
+        <p class="hint">下面就是发给出图接口的全文。改完原样发送。</p>
+        <textarea
+          rows="16"
+          :value="shot.imagePrompt ?? ''"
+          placeholder="2×2 四宫格，正好四格。左上到右下是这一镜的事件。"
+          @input="project.updateShot(shot.id, { imagePrompt: ($event.target as HTMLTextAreaElement).value })"
+        />
+      </template>
+
+      <template v-else-if="node.type === 'shotFrames' && shot">
+        <p class="hint">
+          首尾帧用本镜的人物和场景参考图合成：起始帧画开场那一瞬，结束帧画动作走完的末态。
+          画完的两张直接就是出视频的首帧和尾帧。
+        </p>
+        <div class="lab-row">
+          <label>起始帧画面词</label>
+          <button class="link" type="button" :disabled="running" @click="redrawFrame('start')">重画这一张</button>
+        </div>
+        <textarea
+          rows="9"
+          :value="startFramePromptValue"
+          placeholder="留空则按分镜描述与连续性自动拼"
+          @input="project.updateShot(shot.id, { firstFramePrompt: ($event.target as HTMLTextAreaElement).value })"
+        />
+        <div class="lab-row">
+          <label>结束帧画面词</label>
+          <button class="link" type="button" :disabled="running" @click="redrawFrame('end')">重画这一张</button>
+        </div>
+        <textarea
+          rows="9"
+          :value="endFramePromptValue"
+          placeholder="留空则按「起始 → 末态」里的末态自动拼"
+          @input="project.updateShot(shot.id, { lastFramePrompt: ($event.target as HTMLTextAreaElement).value })"
+        />
+      </template>
+
+      <template v-else-if="node.type === 'shotVideo' && shot">
+        <div class="lab-row">
+          <label>实际出视频提示词</label>
+          <div class="lab-actions">
+            <button v-if="!externalTextOnly"
+              class="link"
+              type="button"
+              :disabled="optimizingPrompt || running"
+              @click="optimizeVideoPrompt"
+            >
+              {{ optimizingPrompt ? '优化中…' : '优化提示词' }}
+            </button>
+            <button v-if="!externalTextOnly" class="link" type="button" :disabled="optimizingPrompt || running" @click="resetVideoPrompt">按分镜重铺</button>
+          </div>
+        </div>
+        <p class="hint">
+          优化按这个框里的原文改写成 H3 格式。你写的台词会进 &lt;d&gt;，口播栏为空也不会删掉。
+        </p>
+        <textarea
+          rows="16"
+          :value="shot.compiledVideoPrompt ?? ''"
+          :placeholder="videoPromptPlaceholder"
+          @input="project.setShotVideoPrompt(shot.id, ($event.target as HTMLTextAreaElement).value)"
+        />
+        <label>时长（秒）</label>
+        <AppNumberInput
+          aria-label="时长（秒）"
+          :min="videoMinSeconds(videoModel)"
+          :max="videoMaxSeconds(videoModel)"
+          step="1"
+          :value="shot.duration"
+          @change="project.updateShot(shot.id, { duration: Math.min(videoMaxSeconds(videoModel), Math.max(videoMinSeconds(videoModel), Math.round(Number(($event.target as HTMLInputElement).value) || shot.duration))) })" />
+        <label>运镜</label>
+        <AppSelect
+          :value="shot.cameraMovement"
+          @change="project.updateShot(shot.id, { cameraMovement: $event as any })"
+        >
+          <option value="static">固定</option>
+          <option value="push">推</option>
+          <option value="pull">拉</option>
+          <option value="pan">摇</option>
+          <option value="tilt">移</option>
+          <option value="orbit">环绕</option>
+        </AppSelect>
+        <p
+          v-if="shot && project.current && stillModeForShot(shot, project.current) === 'storyboard' && !isH3Fl2va && !shot.boardAssetId"
+          class="err"
+        >这一镜还没有故事看板，先生成看板再出视频。</p>
+        <p
+          v-else-if="shot && project.current && stillModeForShot(shot, project.current) === 'keyframe' && !isH3Fl2va && !shot.imageAssetId"
+          class="err"
+        >这一镜还没有四宫格关键帧，当前模型需要关键帧后再出视频。</p>
+        <p v-else-if="isH3Fl2va && lastFrameRequired && shot && !shot.lastFrameAssetId" class="err">
+          这一镜的视频模型要求尾帧，请在下方选择。
+        </p>
+        <p v-else-if="fl2vaChain && shot && !isH3Fl2va" class="hint">
+          项目已开启首尾帧链：第 1 镜用本镜配图起手，第 2 镜起自动接上一镜末帧，不用手动选帧。凑不齐首尾帧时会自动退回常规出片，不会卡住生成。
+        </p>
+      </template>
+
+      <template v-if="node.type === 'shotVideo' && shot">
+        <p class="hint">配图策略 {{ project.current ? stillModeForShot(shot, project.current) : 'identity' }} · {{ frameInputEnabled ? '已选择首尾帧策略' : '当前使用普通参考策略' }}</p>
+        <p v-if="missingProps.length" class="hint" role="status">缺少道具设计图：{{ missingProps.map(prop => prop.name).join('、') }}</p>
+        <label>人声
+          <AppSelect :value="effectiveShotAudioMode(shot)" @change="applyShotAudioMode($event as ShotAudioMode)">
+            <option value="none">无口播</option><option value="h3-dialogue">出镜对白</option>
+            <option value="h3-voiceover">画外音</option><option value="tts">独立配音</option>
+          </AppSelect>
+        </label>
+      </template>
+      <details v-if="shot && ['shotBoard', 'shotImage', 'shotFrames', 'shotVideo'].includes(node.type)" :key="shot.id">
+        <summary>镜头绑定</summary>
+        <fieldset :key="`${project.current?.updatedAt}:${bindingFormRevision}`" :disabled="savingBindings">
+        <label>人物参考
+          <AppSelect :value="shot.subjectBindingMode || 'infer'" @change="applySubjectBinding($event as 'infer' | 'explicit')">
+            <option value="infer">按文字补全</option><option value="explicit">仅显式绑定</option>
+          </AppSelect>
+        </label>
+        <label v-for="subject in project.current?.subjects ?? []" :key="subject.id">
+          <input type="checkbox" :checked="boundPeople.includes(subject.id)"
+            @change="toggleBinding('subject', subject.id, ($event.target as HTMLInputElement).checked)" />
+          {{ subject.name }}
+        </label>
+        <label>场景
+          <AppSelect :value="boundScene ?? ''"
+            @change="editBinding(id => project.saveShotBindings(id, { sceneId: $event || null }))">
+            <option value="">未分配</option>
+            <option v-for="scene in project.current?.scenes ?? []" :key="scene.id" :value="scene.id">{{ scene.name }}</option>
+          </AppSelect>
+        </label>
+        <label v-for="prop in project.current?.props ?? []" :key="prop.id">
+          <input type="checkbox" :checked="boundProps.includes(prop.id)"
+            @change="toggleBinding('prop', prop.id, ($event.target as HTMLInputElement).checked)" />
+          {{ prop.name }}
+        </label>
+        <button v-if="shot.propIds !== undefined" type="button" @click="editBinding(id => project.saveShotBindings(id, { propIds: null }))">恢复道具自动推断</button>
+        </fieldset>
+      </details>
+      <H3GenModeSelect v-if="isH3Video" v-model="h3GenMode" />
+      <p v-if="shot?.imageAssetId && shot.firstFrameAssetId && shot.imageAssetId !== shot.firstFrameAssetId
+        && (node.type === 'shotImage' || node.type === 'shotVideo' || node.type === 'shotFrames')" class="hint">
+        主图和首帧用了不同的图片。视频预检的首帧模式使用「首帧」或本次指定的输入。
+      </p>
+      <FramePairSlots
+        v-if="isH3Fl2va"
+        v-model:first-id="firstFrameId"
+        v-model:last-id="lastFrameId"
+        :last-required="lastFrameRequired"
+        :first-hint="node.type === 'shotVideo' && shot?.imageAssetId ? '空则用本镜配图' : ''"
+      />
+      <ShotRefStrip
+        v-else-if="shot && (node.type === 'shotBoard' || node.type === 'shotImage' || node.type === 'shotVideo')"
+        :shot="shot"
+        :mode="node.type === 'shotVideo' ? 'video' : node.type === 'shotBoard' ? 'board' : 'image'"
+      />
+      <ShotRefStrip
+        v-else-if="node.type === 'subject' || node.type === 'prop' || node.type === 'sceneProps' || node.type === 'scene'"
+        v-model:extra-ids="extraRefIds"
+      />
+      <template v-if="node.type === 'videoGen'">
+        <div class="lab-row">
+          <label>实际出视频提示词</label>
+          <button v-if="!externalTextOnly"
+            class="link"
+            type="button"
+            :disabled="optimizingPrompt || running || videoModel === 'wan-prime'"
+            @click="optimizeVideoPrompt"
+          >
+            {{ optimizingPrompt ? '优化中…' : '优化提示词' }}
+          </button>
+        </div>
+        <p class="hint">优化按这个框里的原文改写成 H3 格式。只有真正台词进 &lt;d&gt;。</p>
+        <textarea
+          rows="12"
+          :value="node.data.prompt ?? ''"
+          placeholder="写视频提示词，描述动作、镜头和声音。"
+          @input="project.setCanvasNodePrompt(node.id, ($event.target as HTMLTextAreaElement).value)"
+        />
+      </template>
+      <div v-if="node.type === 'imageGen' || node.type === 'videoGen'" class="insp-refs">
+        <div class="lab-row"><label>参考图</label></div>
+        <div v-if="inspectorRefIds.length" class="insp-ref-list">
+          <div v-for="id in inspectorRefIds" :key="id" class="insp-ref">
+            <img v-if="inspectorRefUrls[id]" :src="inspectorRefUrls[id]" alt="" />
+            <button type="button" class="insp-ref-del" title="移除这张参考图" @click="removeInspectorRef(id)"><HomeIcon name="close" :size="14" /></button>
+          </div>
+        </div>
+        <p v-else class="hint">还没有参考图。可从素材库选择或直接上传。</p>
+      </div>
+
+      <template v-else-if="node.type === 'audio' && shot">
+        <label>人声方案</label>
+        <AppSelect
+          :value="effectiveShotAudioMode(shot)"
+          @change="project.setShotAudioMode(shot.id, $event as ShotAudioMode)"
+        >
+          <option value="h3-dialogue">H3 出镜对白 + 对口型</option>
+          <option value="h3-voiceover">H3 画外口播</option>
+          <option value="tts">后期 TTS</option>
+          <option value="none">无口播</option>
+        </AppSelect>
+        <label>口播文案</label>
+        <textarea
+          rows="4"
+          :value="shot.voiceover"
+          placeholder="这一镜要说的话"
+          @input="project.updateShot(shot.id, { voiceover: ($event.target as HTMLTextAreaElement).value })"
+        />
+        <TtsModelSelect v-if="effectiveShotAudioMode(shot) === 'tts'" />
+        <label>说话音色</label>
+        <textarea
+          rows="2"
+          :value="shotSpeakerVoice"
+          :placeholder="
+            shotSpeakerName
+              ? `尚未绑定「${shotSpeakerName}」的音色。在人物卡的「音色描述」里填一句，重跑提炼即自动带入`
+              : '口播写成「人物名：台词」后，会自动带上该角色的音色'
+          "
+          @input="project.updateShot(shot.id, { speakerVoice: ($event.target as HTMLTextAreaElement).value })"
+        />
+        <p class="hint">
+          {{
+            shotSpeakerVoice
+              ? '生成视频和后期配音都会带上这句音色。改人物卡的音色描述会立即覆盖这里。'
+              : '同一角色全片一个声线，填一次就够。'
+          }}
+        </p>
+      </template>
+
+      <div v-if="historyIds.length" class="hist">
+        <span>历史版本（点一下切回）</span>
+        <div class="hist-row">
+          <div v-for="hid in historyIds" :key="hid" class="hist-item">
+            <button
+              class="hist-thumb"
+              type="button"
+              title="查看大图"
+              @click="openLightbox(historyUrls[hid], 'image')"
+            >
+              <img v-if="historyUrls[hid]" :src="historyUrls[hid]" alt="" />
+            </button>
+            <button class="hist-use" type="button" @click="restoreHistory(hid)">切回</button>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="isImageNode || isVideoNode" class="insp-params">
+        <ImageModelSelect v-if="isImageNode" />
+        <ImageResolutionSeg
+          v-if="isImageNode && imageResolutionChoices.length"
+          v-model="imageResolution"
+          :choices="imageResolutionChoices"
+        />
+        <VideoModelSelect
+          v-if="isVideoNode"
+          v-model="videoModel"
+          :profile-id="explicitVideoProfileId"
+          @select-profile="onSelectVideoProfile"
+        />
+        <VideoSettingsPopover
+          v-if="isVideoNode"
+          plain
+          :resolution="videoResolution"
+          :resolutions="resolutionChoices"
+          :aspect="nodeAspectRatio"
+          :duration="inspectorDuration"
+          :durations="inspectorDurations"
+          :show-audio="showVideoAudio"
+          :audio="generateAudio"
+          @update:resolution="videoResolution = $event"
+          @update:aspect="nodeAspectRatio = $event"
+          @update:duration="inspectorDuration = $event"
+          @update:audio="generateAudio = $event"
+        />
+      </div>
+      <template v-if="node.type === 'script' && isPlayReady(project.current?.script)">
+        <label>续写方向（可选）</label>
+        <textarea
+          rows="3"
+          :value="continueHint"
+          placeholder="例如：再写两场，写父亲回家之后。不填则顺着往下写 2–3 场。"
+          @input="continueHint = ($event.target as HTMLTextAreaElement).value"
+        />
+      </template>
+      <GradientButton
+        v-if="node.type === 'script' && isPlayReady(project.current?.script)"
+        block
+        :loading="running"
+        :disabled="running"
+        @click="runContinue"
+      >
+        续写剧本
+      </GradientButton>
+      <GradientButton
+        v-if="node.type === 'script'"
+        block
+        :type="isPlayReady(project.current?.script) ? 'secondary' : undefined"
+        :loading="running"
+        :disabled="running"
+        @click="run"
+      >
+        {{ actionLabel }}
+      </GradientButton>
+      <GradientButton
+        v-if="canPickAsset"
+        block
+        type="secondary"
+        :disabled="running"
+        @click="pickerOpen = true"
+      >
+        从资源库选用
+      </GradientButton>
+      <template v-if="node.type === 'script' && isImg2Video">
+        <GradientButton v-if="!externalTextOnly"
+          block
+          type="secondary"
+          :loading="running"
+          :disabled="running || !((project.current?.script?.content || '').trim())"
+          @click="runExtract('subjects')"
+        >
+          提炼角色
+        </GradientButton>
+        <GradientButton v-if="!externalTextOnly"
+          block
+          type="secondary"
+          :loading="running"
+          :disabled="running || !((project.current?.script?.content || '').trim())"
+          @click="runExtract('scenes')"
+        >
+          提炼场景
+        </GradientButton>
+        <GradientButton v-if="!externalTextOnly"
+          block
+          type="secondary"
+          :loading="running"
+          :disabled="running || !canExtractShots"
+          @click="runExtract('shots')"
+        >
+          提炼分镜
+        </GradientButton>
+      </template>
+      <GradientButton
+        v-else-if="node.type === 'script' && canExtractNext"
+        block
+        type="secondary"
+        :loading="running"
+        :disabled="running || !((project.current?.script?.content || '').trim())"
+        @click="runExtract()"
+      >
+        {{ extractLabel }}
+      </GradientButton>
+      <GradientButton
+        v-else-if="node.type !== 'script' || !canExtractNext"
+        block
+        :loading="running"
+        :disabled="!canRun"
+        @click="run"
+      >
+        {{ gateBlocked ? '请先验收剧本' : actionLabel }}
+      </GradientButton>
+      <GradientButton
+        v-if="node.type === 'final' && hasAsset"
+        block
+        type="secondary"
+        @click="downloadFinal"
+      >
+        下载视频
+      </GradientButton>
+      <button class="ghost" type="button" @click="refreshPreview">刷新预览</button>
+    </template>
+    <AssetPicker
+      :open="pickerOpen"
+      kind="image"
+      title="选用已有图片作为本节点结果"
+      show-library
+      default-tab="page"
+      :selected-ids="currentAssetId ? [currentAssetId] : []"
+      @close="pickerOpen = false"
+      @confirm="onPickerConfirm"
+    />
+  </aside>
+</template>
+
+<style scoped>
+.native-video-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.native-video-actions button { font: inherit; color: inherit; background: transparent; border: 1px solid transparent; border-radius: 5px; padding: 3px 7px; cursor: pointer; }
+.native-video-actions button:hover:not(:disabled), .ghost:hover:not(:disabled) { background: var(--control-hover); }
+.native-video-actions button:active:not(:disabled), .ghost:active:not(:disabled) { background: var(--control-pressed); }
+.native-video-actions p { margin: 0; opacity: 0.8; }
+.insp {
+  width: 300px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--color-border);
+  background: var(--glass-frost);
+  padding: 14px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.insp h3 {
+  margin: 0;
+  font-size: 16px;
+}
+.insp-k {
+  font-size: 10px;
+  color: var(--color-text-4);
+  text-transform: uppercase;
+}
+.insp-ref-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  overflow: visible;
+  padding-top: 6px;
+}
+.insp-ref {
+  position: relative;
+  width: 56px;
+  overflow: visible;
+}
+.insp-ref img {
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+  border-radius: 8px;
+  display: block;
+  background: var(--color-bg-2);
+}
+.insp-ref-del {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  z-index: 2;
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid #fff;
+  border-radius: 50%;
+  background: #e5484d;
+  color: #fff !important;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+}
+.empty,
+.err,
+.hint {
+  font-size: 12px;
+  color: var(--color-text-3);
+  margin: 0;
+}
+.err {
+  color: var(--color-error);
+}
+.lab-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.lab-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.link {
+  font-size: 11px;
+  color: var(--color-accent);
+  padding: 0;
+  background: none;
+}
+.link:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+label {
+  font-size: 11px;
+  color: var(--color-text-4);
+}
+input,
+textarea,
+.app-number,
+.app-select {
+  width: 100%;
+  background: var(--color-bg-2);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  color: var(--color-text-1);
+  padding: 8px;
+  font: inherit;
+  font-size: 12px;
+}
+textarea {
+  min-height: 120px;
+  flex: 1;
+}
+.prev {
+  align-self: flex-start;
+  width: 148px;
+  padding: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--color-bg-3);
+  cursor: zoom-in;
+}
+.prev-frame {
+  position: relative;
+  width: 100%;
+  background: var(--color-bg-2);
+}
+.prev img,
+.prev .app-media-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center;
+  display: block;
+}
+.prev span {
+  display: block;
+  font-size: 10px;
+  color: var(--color-text-4);
+  padding: 4px 6px 5px;
+  text-align: center;
+}
+.prev-audio {
+  width: 100%;
+  max-width: 100%;
+  cursor: default;
+  padding: 8px 8px 0;
+}
+.prev-audio .app-media-audio {
+  width: 100%;
+  height: 36px;
+  display: block;
+}
+.prev-video {
+  width: 100%;
+  max-width: 220px;
+  cursor: default;
+}
+.insp-params {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.hist {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.hist > span {
+  font-size: 11px;
+  color: var(--color-text-4);
+}
+.hist-row {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.hist-item {
+  width: 56px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: none;
+}
+.hist-thumb {
+  width: 56px;
+  height: 40px;
+  padding: 0;
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--color-bg-3);
+  cursor: zoom-in;
+}
+.hist-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.hist-use {
+  font-size: 10px;
+  padding: 1px 0;
+  color: var(--color-text-4);
+  background: none;
+}
+.hist-use:hover {
+  color: var(--color-text-1);
+  background: var(--control-hover);
+}
+.ghost {
+  font-size: 12px;
+  color: var(--color-text-3);
+  padding: 6px;
+  border-radius: var(--radius-sm);
+}
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-2);
+}
+.check input {
+  width: auto;
+}
+.seg {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+.seg-btn {
+  border: 1px solid transparent;
+  background: var(--color-fill);
+  color: var(--color-text-2);
+  border-radius: 8px;
+  padding: 8px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.seg-btn.on {
+  color: var(--color-text-1);
+  background: var(--control-selected);
+}
+.seg-btn:hover:not(:disabled) { background: var(--control-hover); }
+.seg-btn:active:not(:disabled) { background: var(--control-pressed); }
+.vol-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.vol-row input[type='range'] {
+  padding: 0;
+  background: transparent;
+  border: none;
+}
+</style>

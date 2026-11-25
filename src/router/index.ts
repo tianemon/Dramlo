@@ -1,0 +1,139 @@
+import { createRouter, createWebHashHistory, type RouteRecordRaw } from 'vue-router'
+import { useProjectStore, useAssetsStore, useSettingsStore } from '@/stores'
+
+const routes: RouteRecordRaw[] = [
+  {
+    path: '/',
+    name: 'home',
+    component: () => import('@/views/HomeView.vue'),
+    meta: { step: null, label: '项目' }
+  },
+  {
+    path: '/studio',
+    name: 'studio',
+    component: () => import('@/views/StudioView.vue'),
+    meta: { step: null, label: '画布' }
+  },
+  {
+    path: '/smart-speech',
+    name: 'smart-speech',
+    component: () => import('@/views/SmartSpeechView.vue'),
+    meta: { step: null, label: '智能口播' }
+  },
+  {
+    path: '/script',
+    name: 'script',
+    component: () => import('@/views/ScriptView.vue'),
+    meta: { step: 'script', label: '1 · 文案' }
+  },
+  {
+    path: '/storyboard',
+    name: 'storyboard',
+    component: () => import('@/views/StoryboardView.vue'),
+    meta: { step: 'storyboard', label: '2 · 分镜' }
+  },
+  {
+    path: '/images',
+    name: 'images',
+    component: () => import('@/views/ImagesView.vue'),
+    meta: { step: 'image', label: '3 · AI 配图' }
+  },
+  {
+    path: '/videos',
+    name: 'videos',
+    component: () => import('@/views/VideosView.vue'),
+    meta: { step: 'video', label: '4 · AI 视频' }
+  },
+  {
+    path: '/edit',
+    name: 'edit',
+    component: () => import('@/views/EditView.vue'),
+    meta: { step: 'edit', label: '5 · 视频剪辑' }
+  },
+  {
+    path: '/caption',
+    name: 'caption',
+    component: () => import('@/views/CaptionView.vue'),
+    meta: { step: 'caption', label: '6 · 字幕' }
+  },
+  {
+    path: '/export',
+    name: 'export',
+    component: () => import('@/views/ExportView.vue'),
+    meta: { step: 'export', label: '7 · 导出' }
+  },
+  {
+    path: '/scripts',
+    name: 'scripts',
+    component: () => import('@/views/ScriptsView.vue'),
+    meta: { step: null, label: '剧本' }
+  },
+  {
+    path: '/drafts',
+    name: 'drafts',
+    component: () => import('@/views/DraftsView.vue'),
+    meta: { step: null, label: '资源库' }
+  },
+  {
+    path: '/extensions',
+    name: 'extensions',
+    component: () => import('@/views/ExtensionsView.vue'),
+    meta: { step: null, label: '扩展库' }
+  },
+  {
+    path: '/creative-skills',
+    name: 'creative-skills',
+    component: () => import('@/views/CreativeSkillsView.vue'),
+    meta: { step: null, label: '创作 Skill 库' }
+  },
+  {
+    path: '/settings/:section?',
+    name: 'settings',
+    component: () => import('@/views/SettingsView.vue'),
+    meta: { step: null, label: '设置' }
+  },
+  {
+    path: '/:pathMatch(.*)*',
+    redirect: '/'
+  }
+]
+
+export const router = createRouter({
+  history: createWebHashHistory(),
+  routes,
+  scrollBehavior() {
+    return { top: 0 }
+  }
+})
+
+/** 进入工作流页之前先恢复 IndexedDB 项目，避免视图把「尚未加载」当成「没有产物」 */
+router.beforeEach(async (to) => {
+  const project = useProjectStore()
+  const assets = useAssetsStore()
+  const settings = useSettingsStore()
+  await settings.ensureHydrated()
+
+  if (to.name === 'settings' && !to.params.section) return '/settings/external'
+
+  await project.ensureLoaded()
+  await assets.refresh()
+  project.startAutoSave()
+  if (to.name !== 'home' && to.name !== 'settings' && to.name !== 'creative-skills' && to.name !== 'extensions') {
+    if (!project.current && project.allProjects.length > 0) {
+      await project.load(project.allProjects[0].id)
+    }
+    project.rememberCurrent()
+  }
+})
+
+/** 工作流步骤定义（顺序，用于侧栏） */
+export const workflowSteps = [
+  { id: 'script', label: '剧本', route: '/script', desc: '输入主题/文案' },
+  { id: 'storyboard', label: '分镜', route: '/storyboard', desc: 'AI 拆解镜头' },
+  { id: 'image', label: 'AI 配图', route: '/images', desc: '生成关键帧' },
+  { id: 'video', label: 'AI 视频', route: '/videos', desc: '图生视频片段' },
+  { id: 'edit', label: '视频剪辑', route: '/edit', desc: '时间线编排' },
+  { id: 'caption', label: '字幕', route: '/caption', desc: '台词配音与字幕' },
+  { id: 'export', label: '导出', route: '/export', desc: '一键合成视频' },
+  { id: 'drafts', label: '资源库', route: '/drafts', desc: '全部图片/视频产物' }
+] as const

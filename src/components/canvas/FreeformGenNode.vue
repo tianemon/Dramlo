@@ -1,0 +1,1148 @@
+<script setup lang="ts">
+import { confirmAction } from '@/composables/useAppConfirmation'
+import AppSelect from '@/components/common/AppSelect.vue'
+const externalTextOnly = Boolean(window.desktop?.isLocalWeb)
+import HomeIcon from '@/components/common/HomeIcon.vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { Handle, Position, useVueFlow } from '@vue-flow/core'
+import { linkedFirstFrame } from '@/services/canvas/extensions'
+import { useAssetsStore, useLibraryStore, useProjectStore, useSettingsStore, useToastStore } from '@/stores'
+import { runCanvasNode, optimizeFreeformVideoPrompt } from '@/services/canvas/runner'
+import { applyShotVideoModel, applyShotVideoProfile } from '@/services/canvas/videoModel'
+import { isNodeRunning, isServerVideoRunning } from '@/services/canvas/jobs'
+import { friendlyAiError, shouldToastAiError } from '@/services/ai/abort'
+import { cssAspectRatio } from '@/services/canvas/layout'
+import { openLightbox } from '@/composables/useLightbox'
+import NodeBusyOverlay from '@/components/canvas/NodeBusyOverlay.vue'
+import AssetPicker from '@/components/common/AssetPicker.vue'
+import ImageModelSelect from '@/components/settings/ImageModelSelect.vue'
+import VideoModelSelect from '@/components/settings/VideoModelSelect.vue'
+import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
+import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
+import CanvasToolbarIcon from '@/components/canvas/CanvasToolbarIcon.vue'
+import NodeLinkPlus from '@/components/canvas/NodeLinkPlus.vue'
+import AspectRatioSeg from '@/components/common/AspectRatioSeg.vue'
+import ImageResolutionSeg from '@/components/common/ImageResolutionSeg.vue'
+import VideoSettingsPopover from '@/components/canvas/VideoSettingsPopover.vue'
+import { pickDocImageResolution, pickDocVideoResolution, videoResolutionChoices, type DocImageResolution } from '@/services/ai/modelOptions'
+import { selectCanvasNode } from '@/services/canvas/canvasBridge'
+import { pickLocalFiles } from '@/utils/pickLocalFiles'
+import {
+  canvasNodeOutputAssetId,
+  resolvedCanvasReferenceAssetIds
+} from '@/services/canvas/references'
+import type { AspectRatio, CanvasNodeType, H3VideoGenMode, ID, VideoGenModel, VideoResolution } from '@/types'
+import {
+  normalizeH3GenMode,
+  normalizeVideoGenModel,
+  videoDurationOptions
+} from '@/types'
+
+const props = defineProps<{
+  id: string
+  selected?: boolean
+  data: {
+    label?: string
+    prompt?: string
+    referenceAssetIds?: string[]
+    referenceSourceNodeIds?: string[]
+    outputAssetId?: string
+    duration?: number
+    aspectRatio?: AspectRatio
+    videoModel?: VideoGenModel
+    nodeType?: CanvasNodeType
+  }
+}>()
+
+const project = useProjectStore()
+const assets = useAssetsStore()
+const library = useLibraryStore()
+const toast = useToastStore()
+const mediaUrl = ref('')
+const posterUrl = ref('')
+const frameRatio = ref('')
+const pickerOpen = ref(false)
+const pickerMode = ref<'ref' | 'output'>('ref')
+const panelOpen = ref(false)
+const moreOpen = ref(false)
+const busyLabel = ref('')
+const optimizingPrompt = ref(false)
+let mediaSeq = 0
+
+const { updateNodeData } = useVueFlow()
+
+const type = computed(() => (props.data.nodeType === 'videoGen' ? 'videoGen' : 'imageGen'))
+const isVideo = computed(() => type.value === 'videoGen')
+const node = computed(() => project.current?.canvas?.nodes.find((n) => n.id === props.id))
+const isCapture = computed(() => Boolean(node.value?.data.captureId))
+const boundRefs = computed(() => {
+  const p = project.current
+  const n = node.value
+  if (!p || !n) return []
+  return (n.data.referenceSourceNodeIds ?? [])
+    .map((id) => canvasNodeOutputAssetId(p, p.canvas?.nodes.find((item) => item.id === id)))
+    .filter((id): id is ID => Boolean(id))
+})
+const refs = computed(() => {
+  const p = project.current
+  return p && node.value ? resolvedCanvasReferenceAssetIds(p, node.value) : []
+})
+const outputId = computed(() => node.value?.data.outputAssetId || props.data.outputAssetId)
+const hasAsset = computed(() => Boolean(outputId.value))
+const generating = computed(() => isNodeRunning(props.id) || isServerVideoRunning(project.current?.id, props.id))
+const title = computed(() => {
+  const shotId = node.value?.data.shotId
+  const shot = shotId ? project.current?.shots.find((item) => item.id === shotId) : undefined
+  if (isVideo.value && shot?.title) return shot.title
+  return node.value?.data.label || (isVideo.value ? '视频' : '图片')
+})
+const prompt = computed({
+  get: () => node.value?.data.prompt ?? '',
+  set: (v: string) => project.setCanvasNodePrompt(props.id, v)
+})
+function rememberFrame(width?: number, height?: number) {
+  if (!width || !height || width < 16 || height < 16) return
+  frameRatio.value = `${Math.round(width)} / ${Math.round(height)}`
+}
+
+const mediaBoxRatio = computed(() => {
+  if (!isVideo.value && mediaUrl.value) return undefined
+  if (isVideo.value && frameRatio.value) return frameRatio.value
+  return cssAspectRatio(aspectRatio.value)
+})
+
+function onFrameLoad(event: Event) {
+  const img = event.target as HTMLImageElement
+  rememberFrame(img.naturalWidth, img.naturalHeight)
+}
+
+const aspectRatio = computed({
+  get: () => node.value?.data.aspectRatio ?? project.current?.settings.aspectRatio ?? '16:9',
+  set: (v: AspectRatio) => project.patchCanvasNode(props.id, { aspectRatio: v, outputAssetId: undefined, videoTaskId: undefined })
+})
+const h3GenMode = computed({
+  get: () => normalizeH3GenMode(node.value?.data.h3GenMode),
+  set: (v: H3VideoGenMode) => {
+    const patch: {
+      h3GenMode: H3VideoGenMode
+      firstFrameAssetId?: ID
+      lastFrameAssetId?: ID
+    } = { h3GenMode: v }
+    if (v === 'fl2va') {
+      if (!node.value?.data.firstFrameAssetId && refs.value[0]) patch.firstFrameAssetId = refs.value[0]
+      if (!node.value?.data.lastFrameAssetId && refs.value[1]) patch.lastFrameAssetId = refs.value[1]
+    }
+    project.patchCanvasNode(props.id, patch)
+  }
+})
+const firstFrameId = computed({
+  get: () => project.current && linkedFirstFrame(project.current, props.id).assetId || node.value?.data.firstFrameAssetId,
+  set: (v: ID | undefined) => project.patchCanvasNode(props.id, { firstFrameAssetId: v })
+})
+const lastFrameId = computed({
+  get: () => node.value?.data.lastFrameAssetId,
+  set: (v: ID | undefined) => project.patchCanvasNode(props.id, { lastFrameAssetId: v })
+})
+const videoModel = computed({
+  get: () => normalizeVideoGenModel(node.value?.data.videoModel),
+  set: (v: VideoGenModel) => applyShotVideoModel(props.id, v)
+})
+const resolutionChoices = computed(() =>
+  videoResolutionChoices({
+    model: videoModel.value,
+    profile: videoModel.value === 'wan-prime' ? null : effectiveVideoProfile.value
+  })
+)
+const videoResolution = computed({
+  get: () => {
+    const choices = resolutionChoices.value
+    if (choices.length) return pickDocVideoResolution(node.value?.data.videoResolution ?? project.current?.settings.defaultVideoResolution, choices) || choices[0]
+    return '768p' as VideoResolution
+  },
+  set: (v: VideoResolution) => project.patchCanvasNode(props.id, { videoResolution: v })
+})
+const isH3Video = computed(() => isVideo.value && videoModel.value !== 'wan-prime')
+
+/* ── 实际出视频的接入线路：节点自己选的优先，没选就用全局当前视频接入 ── */
+const settings = useSettingsStore()
+const VIDEO_PROFILES = computed(() => settings.config.videos ?? [])
+const effectiveVideoProfile = computed(() => {
+  const list = VIDEO_PROFILES.value
+  const own = node.value?.data.videoProfileId
+    ? list.find((p) => p.id === node.value?.data.videoProfileId)
+    : undefined
+  if (own) return own
+  return list.find((p) => p.id === settings.config.activeVideoId) || undefined
+})
+const imageResolutionChoices = computed(
+  () =>
+    settings.config.images.find((item) => item.id === settings.config.activeImageId)?.options?.imageResolutions ||
+    []
+)
+const imageResolution = computed({
+  get: () => pickDocImageResolution(node.value?.data.imageResolution, imageResolutionChoices.value) || '2k',
+  set: (v: DocImageResolution) => project.patchCanvasNode(props.id, { imageResolution: v })
+})
+const showVideoAudio = computed(() => effectiveVideoProfile.value?.options?.videoAudio === true)
+const lastFrameRequired = computed(() => effectiveVideoProfile.value?.options?.lastFrameRequired === true)
+const generateAudio = computed({
+  get: () => Boolean(node.value?.data.generateAudio),
+  set: (v: boolean) => project.patchCanvasNode(props.id, { generateAudio: v })
+})
+const videoKindLabel = computed(() => (isVideo.value ? '' : '图片生成'))
+const isH3Fl2va = computed(() => isH3Video.value && h3GenMode.value === 'fl2va')
+const durationOptions = computed(() => videoDurationOptions(videoModel.value))
+const duration = computed({
+  get() {
+    const raw = Math.round(Number(node.value?.data.duration) || 8)
+    if (isCapture.value) return raw
+    const opts = durationOptions.value
+    if (opts.includes(raw)) return raw
+    const min = opts[0] ?? 1
+    const max = opts[opts.length - 1] ?? 15
+    return Math.min(max, Math.max(min, raw))
+  },
+  set(v: number) {
+    const opts = durationOptions.value
+    const min = opts[0] ?? 1
+    const max = opts[opts.length - 1] ?? 15
+    project.patchCanvasNode(props.id, {
+      duration: Math.min(max, Math.max(min, Math.round(Number(v) || min)))
+    })
+  }
+})
+function pickDuration(n: number) {
+  duration.value = n
+}
+const genLabel = computed(() => (hasAsset.value ? '重绘' : isVideo.value ? '出视频' : '出图'))
+const failMsg = computed(() =>
+  node.value?.status === 'failed' ? node.value.error || '生成失败' : ''
+)
+
+const pageImageIds = computed(() => {
+  const ids: ID[] = []
+  const p = project.current
+  if (!p) return ids
+  for (const n of p.canvas?.nodes ?? []) {
+    if (n.type === 'imageGen' && n.data.outputAssetId) ids.push(n.data.outputAssetId)
+    for (const id of resolvedCanvasReferenceAssetIds(p, n)) ids.push(id)
+  }
+  return [...new Set(ids)]
+})
+
+const refUrls = ref<Record<string, string>>({})
+
+async function loadMedia() {
+  const id = outputId.value
+  const seq = ++mediaSeq
+  frameRatio.value = ''
+  if (!id) {
+    mediaUrl.value = ''
+    posterUrl.value = ''
+    return
+  }
+  const meta = assets.getMeta(id)
+  if (meta && 'width' in meta) rememberFrame(meta.width, meta.height)
+  const url = (await assets.getUrl(id)) || (await library.getUrl(id)) || ''
+  if (seq !== mediaSeq) return
+  mediaUrl.value = url
+  if (isVideo.value && url) {
+    const thumb = await assets.ensureThumb(id).catch(() => '')
+    if (seq !== mediaSeq) return
+    posterUrl.value = thumb || ''
+  } else {
+    posterUrl.value = ''
+  }
+}
+
+watch(
+  () => outputId.value,
+  () => {
+    loadMedia().catch(() => {})
+  },
+  { immediate: true }
+)
+
+watch(
+  () => generating.value,
+  (on, was) => {
+    if (was && !on) loadMedia().catch(() => {})
+  }
+)
+
+watch(
+  () => refs.value.join(','),
+  async () => {
+    const next: Record<string, string> = {}
+    for (const id of refs.value) {
+      next[id] = (await assets.getUrl(id)) || (await library.getUrl(id)) || ''
+    }
+    refUrls.value = next
+  },
+  { immediate: true }
+)
+
+watch(
+  () => props.selected,
+  (on) => {
+    panelOpen.value = Boolean(on)
+    if (!on) {
+      moreOpen.value = false
+
+    }
+  },
+  { immediate: true }
+)
+
+onMounted(() => {
+  document.querySelectorAll('body > input[type="file"]').forEach((el) => el.remove())
+})
+
+onBeforeUnmount(() => {
+  mediaSeq += 1
+  mediaUrl.value = ''
+  posterUrl.value = ''
+})
+
+function setRefs(ids: ID[]) {
+  const max = videoModel.value === 'wan-prime' ? 10 : 9
+  const inherited = new Set(boundRefs.value)
+  const manual = [...new Set(ids)].filter((id) => !inherited.has(id))
+  const next = manual.slice(0, Math.max(0, max - inherited.size))
+  project.patchCanvasNode(props.id, {
+    referenceAssetIds: next
+  })
+  updateNodeData(props.id, {
+    ...props.data,
+    referenceAssetIds: next,
+    nodeType: type.value
+  })
+}
+
+function previewRef(id: ID) {
+  const url = refUrls.value[id]
+  if (url) openLightbox(url, 'image')
+}
+
+function removeRef(id: ID, ev?: Event) {
+  ev?.preventDefault()
+  ev?.stopPropagation()
+  project.removeCanvasNodeRef(props.id, id)
+  const n = project.current?.canvas?.nodes.find((item) => item.id === props.id)
+  updateNodeData(props.id, {
+    ...props.data,
+    referenceSourceNodeIds: n?.data.referenceSourceNodeIds ?? [],
+    referenceAssetIds: n?.data.referenceAssetIds ?? [],
+    nodeType: type.value
+  })
+  toast.success('已移除这张参考图')
+}
+
+async function onPickerConfirm(ids: ID[]) {
+  pickerOpen.value = false
+  if (!ids.length) return
+  try {
+    if (pickerMode.value === 'output') {
+      const kind = isVideo.value ? 'video' : 'image'
+      const asset = await assets.adopt(ids[0], kind, { projectId: project.current?.id })
+      project.assignCanvasNodeAsset(props.id, asset.id)
+      updateNodeData(props.id, {
+        ...props.data,
+        outputAssetId: asset.id,
+        nodeType: type.value
+      })
+      await loadMedia()
+      toast.success(isVideo.value ? '已选用该视频' : '已选用该图片')
+      return
+    }
+    const resolved: ID[] = []
+    for (const id of ids) {
+      try {
+        const copied = await assets.adopt(id, 'image', { projectId: project.current?.id })
+        resolved.push(copied.id)
+      } catch {
+        resolved.push(id)
+      }
+    }
+    setRefs([...refs.value, ...resolved])
+  } catch (e: any) {
+    toast.error(e?.message || '选用失败')
+  }
+}
+
+function openRefPicker() {
+  pickerMode.value = 'ref'
+  pickerOpen.value = true
+}
+
+function openOutputPicker() {
+  pickerMode.value = 'output'
+  pickerOpen.value = true
+}
+
+function onEmptyClick() {
+  if (generating.value) return
+  if (props.selected && panelOpen.value) openOutputPicker()
+}
+
+function uploadRefs() {
+  void pickAndAddRefs()
+}
+
+async function pickAndAddRefs() {
+  let files: File[]
+  try {
+    files = await pickLocalFiles({ kind: 'image', multiple: true })
+  } catch (err: any) {
+    toast.error(err?.message || '读取参考图失败')
+    return
+  }
+  const added: ID[] = []
+  for (const file of files) {
+    if (!file.type.startsWith('image/')) continue
+    const asset = await assets.add(file, 'image', 'uploaded', {
+      filename: file.name,
+      projectId: project.current?.id
+    })
+    added.push(asset.id)
+  }
+  if (added.length) setRefs([...refs.value, ...added])
+}
+
+function togglePlay() {
+  previewFull()
+}
+
+function previewFull() {
+  if (!mediaUrl.value) return
+  selectCanvasNode(props.id)
+  openLightbox(mediaUrl.value, isVideo.value ? 'video' : 'image', title.value)
+}
+
+async function generate() {
+  if (generating.value) return
+  if (!prompt.value.trim()) {
+    toast.warn('请先写提示词')
+    return
+  }
+  if (isVideo.value && !isCapture.value) {
+    if (isH3Fl2va.value) {
+      if (!firstFrameId.value && !refs.value[0] && !(project.current && linkedFirstFrame(project.current, props.id).connected)) {
+        toast.warn('请先选首帧')
+        return
+      }
+      if (lastFrameRequired.value && !lastFrameId.value && !refs.value[1]) {
+        toast.warn('请先选尾帧')
+        return
+      }
+    } else if (!refs.value.length) {
+      toast.warn('请先选至少一张参考图')
+      return
+    }
+  }
+  moreOpen.value = false
+
+  busyLabel.value = isVideo.value ? '出视频…' : '出图…'
+  try {
+    await runCanvasNode(props.id, (_id, msg) => {
+      busyLabel.value = msg
+    })
+    if (outputId.value) {
+      const n = project.current?.canvas?.nodes.find((item) => item.id === props.id)
+      updateNodeData(props.id, {
+        ...(n?.data ?? props.data),
+        outputAssetId: outputId.value,
+        nodeType: type.value
+      })
+    }
+    await loadMedia()
+    if (isVideo.value && !outputId.value) {
+      toast.error('生成结束，但视频没有写进节点。请看节点上的红字错误。', 10000)
+    } else {
+      toast.success(isVideo.value ? '视频已生成' : '图片已生成')
+    }
+  } catch (e: unknown) {
+    if (shouldToastAiError(e)) toast.error(friendlyAiError(e) || '生成失败', 10000)
+  } finally {
+    busyLabel.value = ''
+  }
+}
+
+async function publish() {
+  if (!outputId.value) return
+  moreOpen.value = false
+  try {
+    await library.publishFrom(outputId.value, {
+      filename: title.value,
+      prompt: prompt.value
+    })
+    toast.success('已加入公共资产库')
+  } catch (e: any) {
+    toast.error(e?.message || '入库失败')
+  }
+}
+
+async function downloadAsset() {
+  if (!outputId.value) return
+  const blob = await assets.getBlob(outputId.value)
+  if (!blob) {
+    toast.error('素材读取失败')
+    return
+  }
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `${title.value}.${isVideo.value ? 'mp4' : 'png'}`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function copyPrompt() {
+  const t = prompt.value.trim()
+  if (!t) {
+    toast.warn('没有提示词')
+    return
+  }
+  navigator.clipboard.writeText(t).then(
+    () => toast.success('已复制提示词'),
+    () => toast.error('复制失败')
+  )
+  moreOpen.value = false
+}
+
+async function optimizePrompt(ev?: Event) {
+  ev?.stopPropagation()
+  if (!isH3Video.value || optimizingPrompt.value || generating.value) return
+  if (!prompt.value.trim()) {
+    toast.warn('请先写提示词')
+    return
+  }
+  optimizingPrompt.value = true
+  try {
+    await optimizeFreeformVideoPrompt(props.id)
+    toast.success('已优化提示词')
+  } catch (e: unknown) {
+    toast.error(friendlyAiError(e) || '优化失败')
+  } finally {
+    optimizingPrompt.value = false
+  }
+}
+
+function duplicateSelf() {
+  moreOpen.value = false
+
+  const nid = project.duplicateCanvasNode(props.id)
+  if (!nid) {
+    toast.warn('复制失败')
+    return
+  }
+  toast.success('已复制节点')
+  selectCanvasNode(nid)
+}
+
+async function removeSelf() {
+  moreOpen.value = false
+  if (!await confirmAction('删除这个节点？')) return
+  project.removeCanvasNode(props.id)
+}
+</script>
+
+<template>
+  <div class="fnode" :class="[`kind-${type}`, { on: selected && panelOpen, empty: !hasAsset, busy: generating }]">
+    <NodeLinkPlus :node-id="props.id" />
+    <Handle id="in" type="target" :position="Position.Left" class="hndl" />
+    <Handle v-if="isH3Fl2va" id="first-frame" type="target" :position="Position.Left" :style="{ top: '72%' }" title="首帧" class="hndl" />
+
+    <transition name="float-up">
+      <div v-if="selected && panelOpen" class="toolbar-wrap nodrag nowheel" @mousedown.stop @click.stop>
+        <div class="toolbar">
+          <button type="button" :disabled="generating || optimizingPrompt" @click="generate">
+            <span><HomeIcon name="remake" :size="14" /></span>{{ genLabel }}
+          </button>
+          <button
+            v-if="!externalTextOnly && (isH3Video)"
+            type="button"
+            :disabled="generating || optimizingPrompt"
+            title="只优化当前节点的提示词"
+            @click="optimizePrompt"
+          >
+            <span><CanvasToolbarIcon name="sparkles" :size="14" /></span>{{ optimizingPrompt ? '优化中…' : '优化提示词' }}
+          </button>
+          <button type="button" :disabled="generating" title="选用已有资源，不重新生成" @click="openOutputPicker">
+            <span><HomeIcon name="image" :size="14" /></span>选用
+          </button>
+          <button type="button" @click="duplicateSelf">
+            <span>❐</span>复制
+          </button>
+          <div v-if="isVideo" class="dur-edit">
+            <AppSelect :value="duration" aria-label="视频时长" @change="pickDuration">
+              <option v-for="n in durationOptions" :key="n" :value="n">{{ n }} 秒</option>
+            </AppSelect>
+          </div>
+          <button v-if="hasAsset" type="button" @click="downloadAsset">
+            <span><HomeIcon name="download" :size="14" /></span>下载
+          </button>
+          <button type="button" class="icon" title="更多" @click="moreOpen = !moreOpen"><CanvasToolbarIcon name="more" :size="17" /></button>
+          <button v-if="hasAsset" type="button" class="icon" title="查看大图" @click="previewFull"><CanvasToolbarIcon name="expand" :size="17" /></button>
+          <div v-if="moreOpen" class="more">
+            <button type="button" @click="copyPrompt">复制提示词</button>
+            <button type="button" @click="duplicateSelf">复制节点</button>
+            <button v-if="!isVideo && hasAsset" type="button" @click="publish">加入公共资产库</button>
+            <button type="button" @click="removeSelf">删除节点</button>
+          </div>
+        </div>
+      </div>
+    </transition>
+
+    <div class="media" :class="{ 'natural-image': !isVideo && mediaUrl }" :style="{ aspectRatio: mediaBoxRatio }">
+      <template v-if="isVideo && mediaUrl">
+        <img
+          v-if="posterUrl"
+          class="nowheel frame"
+          :draggable="false"
+          @dragstart.prevent
+          :src="posterUrl"
+          alt=""
+          @load="onFrameLoad"
+        />
+        <div v-else class="ready">视频已生成</div>
+        <button
+          class="play-btn nodrag"
+          type="button"
+          title="播放"
+          @click.stop="previewFull"
+          @mousedown.stop
+        >
+          <HomeIcon name="play" :size="14" />
+        </button>
+      </template>
+      <img
+        v-else-if="mediaUrl"
+        class="nowheel"
+        :draggable="false"
+        @dragstart.prevent
+        :src="mediaUrl"
+        alt=""
+      />
+      <div
+        v-else
+        class="ph pick"
+        :title="isVideo ? '选用已有视频' : '选用已有图片'"
+        @click="onEmptyClick"
+      >
+        <HomeIcon :name="isVideo ? 'play' : 'plus'" :size="16" />
+      </div>
+      <span v-if="isVideo && duration" class="dur-tag">{{ duration }}s</span>
+      <NodeBusyOverlay v-if="generating" :label="busyLabel || (isVideo ? '出视频…' : '出图…')" />
+      <div v-if="failMsg && !generating" class="fail" :title="failMsg">{{ failMsg }}</div>
+    </div>
+
+    <div class="name">
+      <span v-if="videoKindLabel" class="kind">{{ videoKindLabel }}</span>
+      <span class="title">{{ title }}</span>
+    </div>
+
+    <transition name="float-down">
+      <div
+        v-if="selected && panelOpen"
+        class="prompt nodrag nowheel"
+        @pointerdown.stop
+        @mousedown.stop
+        @click.stop
+      >
+        <H3GenModeSelect v-if="isH3Video" v-model="h3GenMode" />
+        <FramePairSlots
+          v-if="isH3Fl2va"
+          v-model:first-id="firstFrameId"
+          v-model:last-id="lastFrameId"
+          :last-required="lastFrameRequired"
+        />
+        <div v-else class="refs">
+          <div v-for="id in refs" :key="id" class="thumb nodrag nopan nowheel">
+            <button type="button" class="thumb-preview nodrag" title="查看大图" @pointerdown.stop @click.stop="previewRef(id)">
+              <img v-if="refUrls[id]" :src="refUrls[id]" alt="" />
+            </button>
+            <button
+              type="button"
+              class="thumb-del nodrag nopan nowheel"
+              title="移除这张参考图"
+              @pointerdown.stop.prevent="removeRef(id, $event)"
+            >
+              <HomeIcon name="close" :size="14" />
+            </button>
+          </div>
+          <button type="button" class="add nodrag" title="上传参考图" @click="uploadRefs"><HomeIcon name="plus" :size="14" /></button>
+          <button type="button" class="add nodrag" title="从本页或资产库选择参考图" @click="openRefPicker">库</button>
+        </div>
+        <div v-if="isH3Video" class="prompt-tools">
+          <button v-if="!externalTextOnly"
+            type="button"
+            class="opt"
+            :disabled="generating || optimizingPrompt"
+            @click="optimizePrompt"
+          >
+            {{ optimizingPrompt ? '优化中…' : '优化提示词' }}
+          </button>
+        </div>
+        <textarea
+          v-model="prompt"
+          rows="6"
+          :placeholder="
+            isVideo
+              ? videoModel === 'wan-prime'
+                ? '写视频提示词。多张参考图时可用图1、图2指代人物/场景…'
+                : '写视频提示词，描述动作、镜头和声音。'
+              : '写提示词，可加参考图做图生图…'
+          "
+        />
+        <div class="prompt-foot">
+          <ImageModelSelect v-if="!isVideo" />
+          <VideoModelSelect
+            v-else
+            v-model="videoModel"
+            :profile-id="node?.data.videoProfileId"
+            @select-profile="(id) => applyShotVideoProfile(props.id, id)"
+          />
+          <!-- 比例和模型同排：一眼看到「用什么模型、出什么画幅」 -->
+          <AspectRatioSeg v-if="!isVideo" v-model="aspectRatio" compact />
+          <ImageResolutionSeg
+            v-if="!isVideo && imageResolutionChoices.length"
+            v-model="imageResolution"
+            :choices="imageResolutionChoices"
+          />
+          <VideoSettingsPopover
+            v-if="isVideo"
+            :resolution="videoResolution"
+            :resolutions="resolutionChoices"
+            :aspect="aspectRatio"
+            :duration="duration"
+            :durations="durationOptions"
+            :show-audio="showVideoAudio"
+            :audio="generateAudio"
+            @update:resolution="videoResolution = $event"
+            @update:aspect="aspectRatio = $event"
+            @update:duration="duration = $event"
+            @update:audio="generateAudio = $event"
+          />
+          <button class="go" type="button" :disabled="generating || optimizingPrompt" :title="genLabel" @click="generate"><HomeIcon name="arrowUp" :size="14" /></button>
+        </div>
+      </div>
+    </transition>
+
+    <Handle id="out" type="source" :position="Position.Right" class="hndl" />
+
+    <AssetPicker
+      :open="pickerOpen"
+      :kind="pickerMode === 'output' && isVideo ? 'video' : 'image'"
+      :multiple="pickerMode === 'ref'"
+      :title="
+        pickerMode === 'output'
+          ? isVideo
+            ? '选用已有视频作为本节点结果'
+            : '选用已有图片作为本节点结果'
+          : isVideo
+            ? videoModel === 'wan-prime'
+              ? '选择参考图（最多 10 张，提示词里可用图1、图2）'
+              : '选择参考图（本页或公共库）'
+            : '选择参考图'
+      "
+      :page-ids="pickerMode === 'ref' ? pageImageIds : undefined"
+      :show-library="pickerMode === 'ref' || !isVideo"
+      :default-tab="pickerMode === 'output' ? 'page' : undefined"
+      :selected-ids="pickerMode === 'output' && outputId ? [outputId] : []"
+      @close="pickerOpen = false"
+      @confirm="onPickerConfirm"
+    />
+  </div>
+</template>
+
+<style scoped>
+.fnode {
+  position: relative;
+  width: 240px;
+  background: var(--color-bg-card);
+  border: 1px solid var(--color-node-border);
+  border-radius: 6px;
+  overflow: visible;
+  color: var(--color-text-1);
+  box-shadow: var(--shadow-node);
+}
+.fnode.on {
+  border-color: var(--color-text-1);
+  box-shadow: 0 0 0 1px var(--color-text-1), var(--shadow-md);
+  z-index: 4;
+}
+.fnode.busy {
+  border-color: var(--color-accent);
+  z-index: 5;
+}
+.toolbar-wrap {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translateX(-50%);
+  z-index: 6;
+  transform-origin: 50% 100%;
+}
+.toolbar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--glass-panel);
+  color: var(--color-text-1);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-md);
+  white-space: nowrap;
+}
+.toolbar > button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 0;
+  padding: 6px 8px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--color-text-1);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.toolbar > button span {
+  font-size: 11px;
+  opacity: 0.7;
+}
+.toolbar > button:hover:not(:disabled) {
+  background: var(--color-fill-hover);
+}
+.toolbar > button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+.toolbar > button.icon {
+  width: 30px;
+  justify-content: center;
+  padding: 6px 0;
+}
+.more {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 4px;
+  min-width: 148px;
+  padding: 4px;
+  border-radius: 8px;
+  background: var(--color-bg-2);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-md);
+}
+.more button {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 7px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  font-size: 12px;
+  color: var(--color-text-1);
+  cursor: pointer;
+}
+.more button:hover {
+  background: var(--color-fill-hover);
+}
+.media {
+  position: relative;
+  width: 100%;
+  background: var(--color-node-well);
+  overflow: hidden;
+  border-radius: inherit;
+}
+.media img,
+.media video,
+.media .frame {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.media .frame {
+  object-fit: cover;
+}
+.media.natural-image > img { height: auto; }
+.media img { user-select: none; -webkit-user-drag: none; cursor: grab; }
+.media img:active { cursor: grabbing; }
+.ready {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-3);
+  font-size: 12px;
+  font-weight: 650;
+}
+.fail {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 7;
+  padding: 6px 8px;
+  background: rgba(180, 40, 40, 0.92);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.35;
+  font-weight: 650;
+  max-height: 46%;
+  overflow: auto;
+}
+.play-btn {
+  display: grid;
+  place-items: center;
+  padding: 0;
+  line-height: 1;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  z-index: 2;
+  width: 44px;
+  height: 44px;
+  margin: 0;
+  border: none;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font-size: 16px;
+  cursor: pointer;
+}
+.play-btn:is(:hover, :focus-visible) {
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+}
+.ph {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-text-4);
+  font-size: 18px;
+}
+.ph.pick {
+  cursor: pointer;
+}
+.dur-tag {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 10px;
+}
+.name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 0 10px;
+}
+.kind {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--color-text-4);
+  letter-spacing: 0.04em;
+}
+.title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.prompt {
+  position: absolute;
+  left: 50%;
+  top: calc(100% + 8px);
+  z-index: 5;
+  width: 520px;
+  transform: translateX(-50%);
+  transform-origin: 50% 0;
+  overflow: visible;
+  background: var(--color-bg-1);
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.4);
+}
+.refs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 8px;
+  padding-top: 2px;
+  overflow: visible;
+}
+.thumb {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  flex-shrink: 0;
+  z-index: 2;
+  overflow: visible;
+  pointer-events: auto;
+}
+.thumb-preview,
+.add {
+  width: 48px;
+  height: 48px;
+  margin: 0;
+  padding: 0;
+  border-radius: 8px;
+  border: 1px solid var(--color-border);
+  overflow: hidden;
+  background: var(--color-bg-2);
+  color: var(--color-text-3);
+  cursor: pointer;
+  pointer-events: auto;
+}
+.add {
+  width: 36px;
+  height: 36px;
+  font-size: 16px;
+  align-self: flex-start;
+}
+.thumb-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  pointer-events: none;
+}
+.thumb-del {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  z-index: 8;
+  box-sizing: border-box;
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1.5px solid #fff;
+  border-radius: 50%;
+  background: #e5484d;
+  color: #fff !important;
+  font-size: 14px;
+  font-weight: 800;
+  line-height: 1;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.55);
+  cursor: pointer;
+  pointer-events: auto;
+}
+.thumb-del:hover {
+  background: #c63c41;
+}
+.prompt textarea {
+  width: 100%;
+  min-height: 240px;
+  resize: vertical;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--color-text-1);
+  font-size: 13px;
+  line-height: 1.55;
+  font-family: inherit;
+}
+.capture-panel > strong { font-size: 13px; color: var(--color-text-1); }
+.capture-panel > p { margin: 8px 0; font-size: 11px; line-height: 1.6; color: var(--color-text-3); }
+.capture-panel .prompt-foot button { border: 1px solid var(--color-border); border-radius: 7px; padding: 6px 10px; background: var(--color-bg-2); color: var(--color-text-1); font-size: 12px; cursor: pointer; }
+.capture-panel .prompt-foot button:disabled { opacity: .5; cursor: default; }
+.prompt-tools {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 4px;
+}
+.opt {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--color-accent);
+  font-size: 11px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.opt:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.prompt-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.prompt-foot > :deep(.psel:first-child) {
+  flex: 1 1 140px;
+}
+.prompt-foot > .go {
+  margin-left: auto;
+}
+.dur-edit {
+  position: relative;
+  flex: 0 0 auto;
+}
+.dur-edit .app-select { height: 28px; min-width: 76px; padding: 0 10px; font-size: 12px; font-weight: 650; }
+.go {
+  width: 28px;
+  height: 28px;
+  margin-left: auto;
+  border: none;
+  border-radius: 50%;
+  background: #ececef;
+  color: #111;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.go:disabled {
+  opacity: 0.4;
+}
+.hndl {
+  width: 8px;
+  height: 8px;
+  background: var(--color-accent);
+  border: 1px solid #fff;
+}
+.float-up-enter-active,
+.float-up-leave-active,
+.float-down-enter-active,
+.float-down-leave-active {
+  transition: opacity 0.2s ease, transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.float-up-enter-from,
+.float-up-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(6px);
+}
+.float-down-enter-from,
+.float-down-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-6px);
+}
+</style>

@@ -1,0 +1,54 @@
+name: Dramlo Web 验证与打包
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  dramlo-web:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: npm ci
+      - name: 验证工具合同与前端逻辑
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          node scripts/dramlo-mcp-schema.mjs --check
+          npm run test:comfy
+          npm run test:continuous
+      - name: 准备测试依赖
+        run: choco install ffmpeg --yes --no-progress
+      - name: 构建并验证发行包
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm run build
+          cargo build --release --locked --manifest-path dramlo-server/Cargo.toml
+          $bundle = node scripts/pack-dramlo-web.mjs
+          $env:DRAMLO_SERVER_BINARY = Join-Path $bundle 'dramlo-server.exe'
+          $env:DRAMLO_TEST_FRONTEND = Join-Path $bundle 'dist'
+          $env:DRAMLO_TEST_PYTHON = (Get-Command python.exe).Source
+          $env:DRAMLO_FFMPEG_BIN = (Get-Command ffmpeg.exe).Source
+          npm run test:dramlo-web
+          npm run test:comfy-discovery
+          "DRAMLO_WEB_BUNDLE=$bundle" >> $env:GITHUB_ENV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dramlo-Web-${{ github.sha }}
+          path: ${{ env.DRAMLO_WEB_BUNDLE }}
+          if-no-files-found: error

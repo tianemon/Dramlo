@@ -1,0 +1,29 @@
+{
+  "aspectRatio": "16:9",
+  "width": 1280,
+  "height": 720,
+  "fps": 30,
+  "defaultShotDuration": 3,
+  "captionStyle": {
+    "fontFamily": "Noto Sans CJK SC",
+    "fontSizeRatio": 0.03,
+    "color": "#ffffff",
+    "strokeColor": "#000000",
+    "strokeWidth": 3,
+    "bgColor": "#000000",
+    "bgOpacity": 0.4,
+    "position": "bottom",
+    "bold": true
+  },
+  "defaultTransition": "none",
+  "bgmVolume": 0.22,
+  "originalVolume": 0.55,
+  "keepAmbientAudio": true,
+  "captionBg": false,
+  "burnCaptions": true,
+  "defaultVideoResolution": "768p",
+  "captionHighlight": false,
+  "captionHighlightColor": "#ffd84d",
+  "captionHighlightScale": 1.2,
+  "ttsVoice": "longanhuan_v3.6"
+}

@@ -1,0 +1,64 @@
+{
+  "name": "dramlo",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Dramlo — a local-first short-drama production workspace for creators and AI agents",
+  "homepage": "https://github.com/tianemon/Dramlo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tianemon/Dramlo.git"
+  },
+  "keywords": [
+    "AI短剧生成",
+    "AI短剧工作台",
+    "AI视频生成",
+    "ai-short-drama",
+    "ai-video-generator",
+    "video-workflow",
+    "storyboard",
+    "image-to-video"
+  ],
+  "scripts": {
+    "dev": "vite",
+    "web": "vite --mode web",
+    "security:check": "node scripts/assert-source-clean.mjs",
+    "build": "node scripts/assert-source-clean.mjs && vue-tsc --noEmit && vite build && node scripts/assert-pack-clean.mjs",
+    "preview": "vite preview --host",
+    "type-check": "vue-tsc --noEmit",
+    "test:agent": "node scripts/test-agent-redo.mjs",
+    "test:comfy": "node scripts/test-comfy-reference-slots.mjs",
+    "test:comfy-discovery": "node scripts/test-comfy-discovery.mjs",
+    "test:workspace": "node scripts/test-workspace-recovery.mjs",
+    "test:dramlo-web": "node scripts/test-dramlo-web.mjs",
+    "test:dramlo": "npm run build && cargo build --locked --manifest-path dramlo-server/Cargo.toml && npm run test:dramlo-web && npm run test:workspace && npm run test:comfy && npm run test:comfy-discovery && npm run test:continuous",
+    "package:dramlo-web": "npm run build && cargo build --release --locked --manifest-path dramlo-server/Cargo.toml && node scripts/pack-dramlo-web.mjs",
+    "mcp:schema": "node scripts/dramlo-mcp-schema.mjs",
+    "test:dramlo:all": "node scripts/dramlo-mcp-schema.mjs --check && npm run test:dramlo",
+    "test:continuous": "node scripts/test-continuous-capture.mjs",
+    "test:chat-compatibility": "node scripts/test-chat-compatibility.mjs"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.92",
+    "@ffmpeg/ffmpeg": "^0.12.10",
+    "@ffmpeg/util": "^0.12.1",
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "@vue-flow/background": "^1.3.2",
+    "@vue-flow/controls": "^1.1.3",
+    "@vue-flow/core": "^1.48.2",
+    "@vue-flow/minimap": "^1.5.4",
+    "ai": "^7.0.172",
+    "naive-ui": "^2.38.2",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.27",
+    "vue-router": "^4.3.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.12",
+    "@vitejs/plugin-vue": "^5.0.4",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.11",
+    "vue-tsc": "^2.0.19"
+  }
+}

@@ -1,0 +1,249 @@
+import type { TaskStatus } from './pipeline'
+// VideoStillMode is declared below and used on CanvasNode.data
+
+export type CanvasNodeType =
+  | 'captureText'
+  | 'script'
+  | 'subject'
+  | 'prop'
+  | 'subjectProps'
+  | 'scene'
+  | 'sceneProps'
+  | 'shotBoard'
+  | 'shotImage'
+  | 'shotFrames'
+  | 'shotVideo'
+  | 'audio'
+  | 'export'
+  | 'final'
+  | 'groupFrame'
+  | 'imageGen'
+  | 'videoGen'
+  | 'audioGen'
+  | 'compose'
+  | 'extension'
+
+/** 图生视频节点模型。默认 H3 15s；h3-v5 为 10 秒且可选 1080p；万相走百炼同一套 Key。 */
+export type VideoGenModel = 'h3' | 'h3-v5' | 'wan-prime'
+
+export type VideoResolution = '480p' | '720p' | '768p' | '1080p'
+
+/** H3 出片方式。reference=多图参考（当前默认）；fl2va=首尾帧。 */
+export type H3VideoGenMode = 'reference' | 'fl2va'
+
+/**
+ * 出视频前的参考图策略。必须在生成视频前按模型定好，画布是否铺「分镜关键帧」也跟它走。
+ * identity：只传角色设计图 + 场景图（H3 默认，不经过看板/四宫格，减少多人物）
+ * keyframe：人设 + 场景 + 四宫格关键帧（万相及其他模型）
+ * storyboard：人设 + 场景 + 故事看板（短剧/电影章节可选）
+ */
+export type VideoStillMode = 'identity' | 'keyframe' | 'storyboard'
+
+export const DEFAULT_VIDEO_GEN_MODEL: VideoGenModel = 'h3'
+export const DEFAULT_H3_GEN_MODE: H3VideoGenMode = 'reference'
+export const DEFAULT_VIDEO_STILL_MODE: VideoStillMode = 'identity'
+
+export function normalizeVideoStillMode(value: unknown): VideoStillMode {
+  if (value === 'keyframe' || value === 'storyboard') return value
+  return 'identity'
+}
+
+export function videoStillNeedsCanvas(mode: VideoStillMode): boolean {
+  return mode !== 'identity'
+}
+
+/** 内置 H3 走人设+场景；万相走关键帧；自定义接入看 profile.stillMode，否则按工作流推断。 */
+export function stillModeForVideoModel(
+  model: VideoGenModel,
+  profile?: { stillMode?: unknown; workflowId?: string; provider?: string } | null
+): VideoStillMode {
+  if (model === 'wan-prime') return 'keyframe'
+  if (model === 'h3-v5') return 'identity'
+  const raw = profile?.stillMode
+  if (raw === 'identity' || raw === 'keyframe' || raw === 'storyboard') return raw
+  const workflow = String(profile?.workflowId || '').toLowerCase()
+  const provider = String(profile?.provider || '').toLowerCase()
+  if (provider === 'dashscope' || workflow.includes('wan')) return 'keyframe'
+  return 'identity'
+}
+
+export function normalizeVideoGenModel(value: unknown): VideoGenModel {
+  if (value === 'wan-prime') return 'wan-prime'
+  if (value === 'h3-v5') return 'h3-v5'
+  return 'h3'
+}
+
+export function isH3VideoFamily(model: VideoGenModel): boolean {
+  return model !== 'wan-prime'
+}
+
+export function videoMinSeconds(model: VideoGenModel): number {
+  return model === 'wan-prime' ? 2 : 1
+}
+
+export function videoMaxSeconds(model: VideoGenModel): number {
+  if (model === 'wan-prime') return 30
+  if (model === 'h3-v5') return 10
+  return 15
+}
+
+export function videoMaxRefImages(_model?: VideoGenModel): number {
+  return 9
+}
+
+export function videoDurationOptions(model: VideoGenModel): number[] {
+  const min = videoMinSeconds(model)
+  const max = videoMaxSeconds(model)
+  return Array.from({ length: max - min + 1 }, (_, i) => min + i)
+}
+
+export function videoAllows1080p(model: VideoGenModel): boolean {
+  return model === 'h3-v5'
+}
+
+export function normalizeVideoResolution(value: unknown, model: VideoGenModel): VideoResolution {
+  const raw = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s/g, '')
+  if (raw === '480p' || raw === '480') return '480p'
+  if (raw === '720p' || raw === '720') return '720p'
+  if (raw === '1080p' || raw === '1080') return '1080p'
+  if (raw === '768p' || raw === '768') return '768p'
+  if (model === 'wan-prime') return '720p'
+  if (model === 'h3-v5') return '1080p'
+  return '768p'
+}
+
+export function normalizeH3GenMode(value: unknown): H3VideoGenMode {
+  return value === 'fl2va' ? 'fl2va' : 'reference'
+}
+
+export interface CanvasNodeData {
+  subjectId?: string
+  propId?: string
+  sceneId?: string
+  shotId?: string
+  label?: string
+  width?: number
+  height?: number
+  /** 画布展示的等比尺寸倍率，与模型分辨率无关。 */
+  canvasScale?: number
+  kind?: string
+  prompt?: string
+  /** 连续拍专用节点：使用独立调度，不进入普通生成流程。 */
+  captureId?: string
+  /** 连续拍计划的执行用 JSON，不在节点上直接展示。 */
+  captureJson?: string
+  /** 提交后未取得任务ID时保守停止，避免网络异常造成重复付费。 */
+  captureSubmissionPending?: boolean
+  referenceAssetIds?: string[]
+  /** 通过画布连线继承参考图的上游节点，顺序即图1、图2…… */
+  referenceSourceNodeIds?: string[]
+  extensionResult?: unknown
+  extensionType?: string
+  extensionExecutor?: string
+  extensionVersion?: number
+  extensionVideoAssetId?: string
+  extensionParams?: Record<string, string | number | boolean>
+  extensionSourceAssetId?: string
+  outputAssetId?: string
+  duration?: number
+  /** 节点自己的画幅；为空时只继承项目默认值，不反向修改其他节点。 */
+  aspectRatio?: import('./project').AspectRatio
+  videoModel?: VideoGenModel
+  /** 当前节点锁定的视频接入，避免不同供应商配置互相串用。 */
+  videoProfileId?: string
+  /** 这一镜出视频时用什么参考图；切模型时写入，决定画布是否铺分镜关键帧 */
+  videoStillMode?: VideoStillMode
+  /** 这一镜的视频分辨率。万相可选 480P / 720P / 1080P，H3 v5 可选 768p / 1080p */
+  videoResolution?: VideoResolution
+  /** 文档列出的出图档位，节点上由用户选 1K / 2K / 4K */
+  imageResolution?: '1k' | '2k' | '4k'
+  /** 文档有音频开关时，节点上的有声 / 无声 */
+  generateAudio?: boolean
+  /** H3：参考图生成（默认）或首尾帧 */
+  h3GenMode?: H3VideoGenMode
+  firstFrameAssetId?: string
+  lastFrameAssetId?: string
+  /** AutoDL / 万相进行中任务，重试时先查结果 */
+  videoTaskId?: string
+  /** 音频节点选用的 TTS 模型。只有声音复刻类模型才使用参考音频。 */
+  ttsModel?: string
+  referenceAudioAssetId?: string
+  clonedVoiceId?: string
+  clonedVoiceModel?: string
+}
+
+interface CanvasNodeBase {
+  id: string
+  position: { x: number; y: number }
+  status?: TaskStatus
+  error?: string
+  parentGroupId?: string
+}
+
+const layoutData = ['label', 'width', 'height', 'canvasScale', 'aspectRatio'] as const
+const ownedCanvasData = {
+  subject: [...layoutData, 'subjectId', 'imageResolution'],
+  shotVideo: [...layoutData, 'shotId', 'videoModel', 'videoStillMode', 'videoResolution', 'generateAudio'],
+  videoGen: [...layoutData, 'prompt', 'captureId', 'captureSubmissionPending', 'referenceAssetIds',
+    'referenceSourceNodeIds', 'outputAssetId', 'duration', 'videoModel', 'videoProfileId', 'videoStillMode',
+    'videoResolution', 'generateAudio', 'h3GenMode', 'firstFrameAssetId', 'lastFrameAssetId', 'videoTaskId']
+} as const satisfies Partial<Record<CanvasNodeType, readonly (keyof CanvasNodeData)[]>>
+
+type OwnedCanvasNodeType = keyof typeof ownedCanvasData
+type OwnedDataKey<T extends OwnedCanvasNodeType> = (typeof ownedCanvasData)[T][number]
+// Existing projects may still carry the old profile override on a video node.
+type TypedCanvasData<T extends OwnedCanvasNodeType> = Pick<CanvasNodeData, OwnedDataKey<T>> &
+  Partial<Record<Exclude<keyof CanvasNodeData, OwnedDataKey<T>>, never>>
+
+export type CanvasNodeOf<T extends CanvasNodeType> = T extends OwnedCanvasNodeType
+  ? CanvasNodeBase & { type: T; data: TypedCanvasData<T> }
+  : CanvasNodeBase & { type: T; data: CanvasNodeData }
+
+export type CanvasNode = { [T in CanvasNodeType]: CanvasNodeOf<T> }[CanvasNodeType]
+
+export function acceptsCanvasData(type: CanvasNodeType, key: keyof CanvasNodeData): boolean {
+  const fields: readonly (keyof CanvasNodeData)[] | undefined =
+    Object.hasOwn(ownedCanvasData, type) ? ownedCanvasData[type as OwnedCanvasNodeType] : undefined
+  return !fields || fields.includes(key)
+}
+
+export interface CanvasEdge {
+  id: string
+  source: string
+  target: string
+  sourceHandle?: string
+  targetHandle?: string
+  /** 由镜头字段派生的绑定线（人物/场景/道具→镜头），删除它不会改变绑定，所以禁止直接删。 */
+  deletable?: boolean
+}
+
+export interface CanvasGroup {
+  id: string
+  label: string
+  nodeIds: string[]
+}
+
+export interface CanvasViewport {
+  x: number
+  y: number
+  zoom: number
+}
+
+export interface CanvasGraph {
+  nodes: CanvasNode[]
+  edges: CanvasEdge[]
+  groups: CanvasGroup[]
+  viewport: CanvasViewport
+}
+
+export function emptyCanvas(): CanvasGraph {
+  return {
+    nodes: [],
+    edges: [],
+    groups: [],
+    viewport: { x: 0, y: 0, zoom: 0.85 }
+  }
+}

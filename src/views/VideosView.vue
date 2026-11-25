@@ -1,0 +1,968 @@
+<script setup lang="ts">
+import AppNumberInput from '@/components/common/AppNumberInput.vue'
+import AppMedia from '@/components/common/AppMedia.vue'
+import { confirmAction } from '@/composables/useAppConfirmation'
+import AppSelect from '@/components/common/AppSelect.vue'
+const externalTextOnly = Boolean(window.desktop?.isLocalWeb)
+import HomeIcon from '@/components/common/HomeIcon.vue'
+import { ref, computed, onMounted, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import { useProjectStore, useAssetsStore, useToastStore } from '@/stores'
+import { needsShotFrames, shotUsesFrames, stillModeForShot, shotMissingStill } from '@/utils/videoStill'
+import { compiledPromptStale } from '@/utils/shot'
+import { applyShotVideoModel } from '@/services/canvas/videoModel'
+import { generateShotVideo, generateShotFramePair, rewriteShotPerformance, optimizeShotVideoPrompt, isFl2vaChainActive } from '@/services/canvas/runner'
+import { prepareNativeShotVideos } from '@/services/canvas/prepareNativeVideo'
+import { useSettingsStore } from '@/stores'
+import StudioVideoStatus from '@/components/canvas/StudioVideoStatus.vue'
+import { getVideoPromptStyle } from '@/services/ai/runtime'
+import { effectiveShotAudioMode } from '@/utils/shot'
+import GlassCard from '@/components/common/GlassCard.vue'
+import GradientButton from '@/components/common/GradientButton.vue'
+import EmptyState from '@/components/common/EmptyState.vue'
+import Tag from '@/components/common/Tag.vue'
+import ProgressRing from '@/components/common/ProgressRing.vue'
+import AssetPicker from '@/components/common/AssetPicker.vue'
+import H3GenModeSelect from '@/components/settings/H3GenModeSelect.vue'
+import VideoModelSelect from '@/components/settings/VideoModelSelect.vue'
+import VideoResolutionSeg from '@/components/common/VideoResolutionSeg.vue'
+import FramePairSlots from '@/components/canvas/FramePairSlots.vue'
+import {
+  normalizeH3GenMode,
+  normalizeVideoGenModel,
+  normalizeVideoResolution,
+  videoAllows1080p,
+  videoMaxSeconds,
+  videoMinSeconds,
+  type H3VideoGenMode,
+  type Shot,
+  type ID,
+  type VideoGenModel,
+  type VideoResolution
+} from '@/types'
+import { openLightbox } from '@/composables/useLightbox'
+
+const router = useRouter()
+const project = useProjectStore()
+const assets = useAssetsStore()
+const settings = useSettingsStore()
+const batching = ref(false)
+const localWeb = Boolean(window.desktop?.isLocalWeb)
+const toast = useToastStore()
+
+const generating = ref<Set<string>>(new Set())
+const optimizing = ref<Set<string>>(new Set())
+const progress = ref<Record<string, string>>({})
+const videoUrls = ref<Record<string, string>>({})
+const imageUrls = ref<Record<string, string>>({})
+const historyUrls = ref<Record<string, string>>({})
+const expanded = ref<Set<string>>(new Set())
+const pickerShotId = ref<string | null>(null)
+
+onMounted(async () => {
+  if (!project.current?.shots.length) {
+    toast.warn('请先生成分镜')
+    router.push('/storyboard')
+    return
+  }
+  await loadVideos()
+  await loadImages()
+  await loadHistory()
+})
+
+const shots = computed(() => project.current?.shots ?? [])
+watch(() => JSON.stringify([project.current?.id, project.current?.speechWorkflow?.imageAssetId,
+  ...shots.value.map(shot => [shot.id, shot.videoAssetId, shot.imageAssetId, shot.boardAssetId, shot.videoHistoryIds])]), () => {
+  void loadVideos()
+  void loadImages()
+  void loadHistory()
+})
+const isDigitalHuman = computed(() =>
+  project.current?.pipelineMode === 'smart-speech' &&
+  project.current?.speechWorkflow?.mode === 'digital-human'
+)
+const aspectRatio = computed(() => project.current?.settings.aspectRatio ?? '16:9')
+const width = computed(() => project.current?.settings.width ?? 1280)
+const height = computed(() => project.current?.settings.height ?? 720)
+const aesthetic = computed(() => project.current?.script?.h3Aesthetic || project.current?.script?.aesthetic || '')
+const videoPromptPlaceholder = computed(() =>
+  getVideoPromptStyle() === 'formatted'
+    ? '每个角色的表情神态、手脚动作、环境怎么动、说什么原词、镜头怎么走。写细才有表现力。'
+    : '画面中：站位、发型、衣服、动作、年龄的人是谁。空一行后连续写这一镜怎么演、台词原词、环境动势、镜头怎么收。'
+)
+
+/** 项目开了首尾帧链：镜头之间要接上一镜末帧，出片必须串行 */
+const fl2vaChain = computed(() => isFl2vaChainActive(project.current))
+/** 有镜头需要首尾帧（含单镜自己的设置）：出现「画首尾帧」入口，批量前先补帧 */
+const needsFrameWork = computed(() => needsShotFrames(project.current))
+
+/** 还没画首尾帧的镜头（只算走首尾帧的镜头，混合模式下普通镜头不算缺） */
+const shotsWithoutFrames = computed(() =>
+  shots.value.filter(
+    (s) => project.current && shotUsesFrames(s, project.current) && (!s.firstFrameAssetId || !s.lastFrameAssetId)
+  )
+)
+const drawingFrames = ref(false)
+
+/** 按顺序把每一镜的起始帧和结束帧画出来：这一镜起始帧接着上一镜结束帧 */
+async function generateAllFrames() {
+  const targets = [...shotsWithoutFrames.value].sort((a, b) => a.index - b.index)
+  if (!targets.length || drawingFrames.value) return
+  drawingFrames.value = true
+  toast.info(`按镜号串行画 ${targets.length} 个镜头的首尾帧…`, 4000)
+  let done = 0
+  for (const shot of targets) {
+    try {
+      await generateShotFramePair(shot, (msg) => {
+        progress.value[shot.id] = msg
+      })
+      done += 1
+    } catch (e: any) {
+      toast.error(`分镜 ${shot.index + 1} 首尾帧画失败：${e.message}`)
+    } finally {
+      delete progress.value[shot.id]
+    }
+  }
+  drawingFrames.value = false
+  if (done) toast.success(`${done} 个镜头的首尾帧已画好，可以直接出视频了`)
+}
+
+/** 链模式卡住时的逃生开关：一键回到每镜按自己参考图出片的自动模式 */
+function turnOffChain() {
+  const p = project.current
+  if (!p) return
+  p.settings = { ...p.settings, h3ShotChainMode: 'auto' }
+  void project.save()
+  toast.success('已切回自动模式：每镜按自己的参考图出片。')
+}
+
+/** 真正的第 1 镜：删过镜头后 index 不一定连续，按排序后的位置认 */
+const firstShotId = computed(
+  () => [...shots.value].sort((a, b) => a.index - b.index)[0]?.id ?? ''
+)
+function isFirstShot(shot: Shot) {
+  return firstShotId.value !== '' && firstShotId.value === shot.id
+}
+
+const shotsWithoutStill = computed(() =>
+  isDigitalHuman.value
+    ? []
+    : shots.value.filter(
+        (s) =>
+          project.current &&
+          normalizeH3GenMode(s.h3GenMode) !== 'fl2va' &&
+          shotMissingStill(s, project.current)
+      )
+)
+
+function shotH3Mode(shot: Shot): H3VideoGenMode {
+  return normalizeH3GenMode(shot.h3GenMode)
+}
+
+function setShotH3Mode(shot: Shot, mode: H3VideoGenMode) {
+  project.updateShot(shot.id, { h3GenMode: mode })
+}
+
+function shotVideoNodeId(shot: Shot) {
+  return project.current?.canvas?.nodes.find((n) => n.type === 'shotVideo' && n.data.shotId === shot.id)?.id
+}
+
+function shotVideoModel(shot: Shot): VideoGenModel {
+  const node = project.current?.canvas?.nodes.find((n) => n.type === 'shotVideo' && n.data.shotId === shot.id)
+  return normalizeVideoGenModel(node?.data.videoModel)
+}
+
+function shotVideoResolution(shot: Shot): VideoResolution {
+  const node = project.current?.canvas?.nodes.find((n) => n.type === 'shotVideo' && n.data.shotId === shot.id)
+  return normalizeVideoResolution(node?.data.videoResolution ?? project.current?.settings.defaultVideoResolution, shotVideoModel(shot))
+}
+
+function setShotVideoModel(shot: Shot, model: VideoGenModel) {
+  const id = shotVideoNodeId(shot)
+  if (!id) return
+  applyShotVideoModel(id, model)
+}
+
+function setShotVideoResolution(shot: Shot, resolution: VideoResolution) {
+  const id = shotVideoNodeId(shot)
+  if (id) project.patchCanvasNode(id, { videoResolution: resolution })
+}
+
+function clampShotDuration(shot: Shot, raw: number) {
+  const model = shotVideoModel(shot)
+  const min = videoMinSeconds(model)
+  const max = videoMaxSeconds(model)
+  return Math.min(max, Math.max(min, Math.round(Number(raw) || shot.duration || min)))
+}
+const shotsWithoutVideo = computed(() =>
+  shots.value.filter((s) => !s.videoAssetId)
+)
+
+let videoLoad = 0
+async function loadVideos() {
+  const load = ++videoLoad
+  const next: Record<string, string> = {}
+  for (const s of shots.value) {
+    if (s.videoAssetId) {
+      const url = await assets.getUrl(s.videoAssetId)
+      if (url) next[s.id] = url
+    }
+  }
+  if (load === videoLoad) videoUrls.value = next
+}
+
+let imageLoad = 0
+async function loadImages() {
+  const load = ++imageLoad
+  const next: Record<string, string> = {}
+  const speechImage = isDigitalHuman.value ? project.current?.speechWorkflow?.imageAssetId : undefined
+  for (const s of shots.value) {
+    const previewId = isDigitalHuman.value
+      ? speechImage || s.imageAssetId
+      : s.boardAssetId || s.imageAssetId
+    if (previewId) {
+      const url = await assets.getUrl(previewId)
+      if (url) next[s.id] = url
+    }
+  }
+  if (load === imageLoad) imageUrls.value = next
+}
+
+let historyLoad = 0
+async function loadHistory() {
+  const load = ++historyLoad
+  const next: Record<string, string> = {}
+  for (const s of shots.value) {
+    for (const id of s.videoHistoryIds ?? []) {
+      const url = await assets.ensureThumb(id)
+      if (url) next[id] = url
+    }
+  }
+  if (load === historyLoad) historyUrls.value = next
+}
+
+function updateVideoPrompt(shot: Shot, value: string) {
+  project.setShotVideoPrompt(shot.id, value)
+}
+
+async function resetVideoPrompt(shot: Shot) {
+  try {
+    await rewriteShotPerformance(shot)
+    toast.success('已按本镜剧情重写视频内容表现')
+  } catch (e: any) {
+    toast.error(e?.message || '重写失败')
+  }
+}
+
+async function optimizeVideoPrompt(shot: Shot) {
+  if (optimizing.value.has(shot.id)) return
+  optimizing.value = new Set(optimizing.value).add(shot.id)
+  try {
+    await optimizeShotVideoPrompt(shot)
+    expanded.value = new Set(expanded.value).add(shot.id)
+    toast.success('已优化提示词')
+  } catch (e: any) {
+    toast.error(e?.message || '优化失败')
+  } finally {
+    const next = new Set(optimizing.value)
+    next.delete(shot.id)
+    optimizing.value = next
+  }
+}
+
+function changeAudioMode(shot: Shot, mode: NonNullable<Shot['audioMode']>) {
+  if (effectiveShotAudioMode(shot) === mode) return
+  const hadVideo = Boolean(shot.videoAssetId)
+  project.setShotAudioMode(shot.id, mode)
+  if (hadVideo) toast.info('人声方案已改变，旧视频已放入历史；请重新生成本镜以避免声音或口型不匹配。', 6000)
+}
+
+function composedPrompt(shot: Shot) {
+  return shot.compiledVideoPrompt ?? ''
+}
+
+function toggleExpanded(id: string) {
+  const next = new Set(expanded.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expanded.value = next
+}
+
+async function generateOne(shot: Shot, partOfBatch = false) {
+  if (batching.value && !partOfBatch) return false
+  const next = new Set(generating.value)
+  next.add(shot.id)
+  generating.value = next
+  try {
+    if (!partOfBatch && await prepareNativeShotVideos([shot])) {
+      toast.info('镜头已预检，请在视频状态栏展开并确认开始')
+      return true
+    }
+    const asset = await generateShotVideo(shot, (msg) => {
+      progress.value[shot.id] = msg
+    })
+    const current = project.current?.shots.find(item => item.id === shot.id)
+    const selected = current?.videoAssetId === asset.id
+    toast.success(selected ? `分镜 ${shot.index + 1} 视频已生成并选用` : `分镜 ${shot.index + 1} 视频已归档为候选`)
+    return true
+  } catch (e: any) {
+    toast.error(`分镜 ${shot.index + 1} 视频生成失败：${e.message}`)
+    return false
+  } finally {
+    const done = new Set(generating.value)
+    done.delete(shot.id)
+    generating.value = done
+    delete progress.value[shot.id]
+  }
+}
+
+async function generateAll() {
+  const current = project.current
+  if (!current || batching.value || generating.value.size || drawingFrames.value) return
+  const targets = shots.value.filter(shot => !shot.videoAssetId).sort((a, b) => a.index - b.index)
+  if (!targets.length) return
+  batching.value = true
+  let unlock: (() => void) | undefined
+  try {
+    if (await prepareNativeShotVideos(targets)) {
+      toast.info('批次已预检，请在视频状态栏展开并确认开始')
+      return
+    }
+    if (!await confirmAction(`按顺序生成 ${targets.length} 镜？当前镜头保存后才开始下一镜，失败即停。`)) return
+    if (needsFrameWork.value && shotsWithoutFrames.value.length) {
+      throw new Error('请先补齐首尾帧，再确认视频批次')
+    }
+    unlock = project.lockActiveProject()
+    for (const shot of targets) {
+      if (!await generateOne(shot, true)) break
+    }
+  } catch (error) {
+    toast.error(error instanceof Error ? error.message : '批量生成未能开始')
+  } finally {
+    unlock?.()
+    batching.value = false
+  }
+}
+
+async function restoreHistory(shot: Shot, assetId: ID) {
+  project.assignShotVideo(shot.id, assetId)
+  await project.save()
+  toast.success('已切回历史版本')
+}
+
+async function onPickerConfirm(ids: ID[]) {
+  const shotId = pickerShotId.value
+  pickerShotId.value = null
+  if (!shotId || ids.length === 0) return
+  const shot = shots.value.find((s) => s.id === shotId)
+  if (!shot) return
+  project.assignShotVideo(shot.id, ids[0])
+  await project.save()
+  toast.success(`分镜 ${shot.index + 1} 已从资源库选用视频`)
+}
+
+async function next() {
+  if (shots.value.some((s) => !s.videoAssetId)) {
+    if (!await confirmAction('还有分镜没生成视频，确定进入剪辑？')) return
+  }
+  router.push('/edit')
+}
+</script>
+
+<template>
+  <div class="page">
+    <StudioVideoStatus v-if="localWeb && project.current" :project-id="project.current.id" />
+    <header class="page-head">
+      <div>
+        <h1>AI 视频生成</h1>
+        <p v-if="isDigitalHuman">每次生成和重新生成都强制使用项目上传的人物图作为唯一参考，并锁定人物、服装、背景、构图和机位。</p>
+        <p v-else>H3 可用人设、场景、配图或参考图出视频；故事看板可选。口播人声请到「字幕」步骤按台词生成。</p>
+      </div>
+      <div class="head-actions">
+        <GradientButton type="ghost" @click="router.push('/images')">上一步</GradientButton>
+        <GradientButton
+          v-if="needsFrameWork && !isDigitalHuman"
+          type="ghost"
+          icon="image"
+          :loading="drawingFrames"
+          :disabled="shotsWithoutFrames.length === 0"
+          @click="generateAllFrames"
+        >
+          {{
+            drawingFrames
+              ? `画帧中 ${shotsWithoutFrames.length} 镜`
+              : shotsWithoutFrames.length
+                ? `画首尾帧（${shotsWithoutFrames.length} 镜）`
+                : '首尾帧已齐'
+          }}
+        </GradientButton>
+        <GradientButton
+          icon="wand"
+          :loading="batching || generating.size > 0"
+          :disabled="batching || shotsWithoutVideo.length === 0"
+          @click="generateAll"
+        >
+          {{
+            generating.size > 0
+              ? `生成中 ${generating.size}/${shotsWithoutVideo.length}`
+              : fl2vaChain
+                ? '按顺序串行生成全部'
+                : '一键生成全部'
+          }}
+        </GradientButton>
+        <GradientButton @click="next">下一步：剪辑</GradientButton>
+      </div>
+    </header>
+
+    <GlassCard v-if="shotsWithoutStill.length > 0" padding="md" class="warn-card">
+      还有 {{ shotsWithoutStill.length }} 个分镜缺当前模型需要的参考图。H3 只需要人设和场景；万相需要四宫格关键帧。
+    </GlassCard>
+
+    <GlassCard v-if="fl2vaChain && !isDigitalHuman" padding="md" class="chain-card">
+      <div class="chain-row">
+        <span>
+          首尾帧链：每一镜先用本镜的人物和场景合成起始帧和结束帧，再用这两张出视频。
+          画布上「首尾帧」那一组就是干这个的，也可以直接点右上角「画首尾帧」。画帧和出片都按镜号串行，
+          因为这一镜的起始帧要接着上一镜的结束帧 —— 并发会把衔接丢掉。凑不齐首尾帧的镜头会自动退回常规出片，不会卡住。
+        </span>
+        <button class="chain-off" @click="turnOffChain">切回自动模式</button>
+      </div>
+    </GlassCard>
+
+    <EmptyState
+      v-if="shots.length === 0"
+      icon="video"
+      title="还没有分镜"
+      description="请先回到分镜步骤"
+    />
+
+    <div v-else class="grid">
+      <GlassCard
+        v-for="shot in shots"
+        :key="shot.id"
+        padding="md"
+        :class="['shot-card', { generating: generating.has(shot.id) }]"
+      >
+        <div class="shot-head">
+          <div class="shot-num">{{ shot.index + 1 }}</div>
+          <div class="shot-title">{{ shot.title }}</div>
+          <Tag v-if="shot.videoAssetId" type="success" size="sm">已完成</Tag>
+          <Tag v-else-if="generating.has(shot.id)" type="warning" size="sm">生成中</Tag>
+          <Tag v-else-if="compiledPromptStale(shot)" type="warning" size="sm">终稿待更新</Tag>
+          <Tag
+            v-else-if="fl2vaChain && isFirstShot(shot) && !shot.firstFrameAssetId && !shot.imageAssetId"
+            type="warning"
+            size="sm"
+          >无首帧·常规出片</Tag>
+          <Tag v-else-if="shotH3Mode(shot) === 'fl2va' && !shot.lastFrameAssetId" type="error" size="sm">缺尾帧</Tag>
+          <Tag
+            v-else-if="shotH3Mode(shot) !== 'fl2va' && project.current && stillModeForShot(shot, project.current) === 'storyboard' && !shot.boardAssetId"
+            type="error"
+            size="sm"
+          >缺看板</Tag>
+          <Tag
+            v-else-if="shotH3Mode(shot) !== 'fl2va' && project.current && stillModeForShot(shot, project.current) === 'keyframe' && !shot.imageAssetId"
+            type="error"
+            size="sm"
+          >缺关键帧</Tag>
+          <Tag v-else size="sm">待生成</Tag>
+        </div>
+
+        <div class="shot-video">
+          <AppMedia
+            v-if="videoUrls[shot.id]"
+            :src="videoUrls[shot.id]"
+            muted
+            loop
+            playsinline
+          />
+          <div v-else-if="generating.has(shot.id)" class="placeholder">
+            <ProgressRing :progress="0.5" :size="64" :stroke-width="3" />
+            <div class="progress-msg">{{ progress[shot.id] || '处理中...' }}</div>
+          </div>
+          <div v-else class="placeholder">
+            <img
+              v-if="imageUrls[shot.id]"
+              :src="imageUrls[shot.id]"
+              class="still zoomable"
+              alt=""
+              title="点击查看大图"
+              @click="openLightbox(imageUrls[shot.id], 'image', shot.title)"
+            />
+            <div v-else class="placeholder-icon"><HomeIcon name="film" :size="14" /></div>
+            <div class="placeholder-text">未生成</div>
+          </div>
+        </div>
+
+        <div
+          v-if="(shot.videoHistoryIds?.length ?? 0) > 0"
+          class="history"
+        >
+          <span class="history-label">历史版本</span>
+          <button
+            v-for="hid in shot.videoHistoryIds"
+            :key="hid"
+            class="history-item"
+            title="切回这个版本"
+            @click="restoreHistory(shot, hid)"
+          >
+            <img
+              v-if="historyUrls[hid]"
+              class="zoomable"
+              :src="historyUrls[hid]"
+              alt=""
+              title="查看大图并切回这个版本"
+              @click="openLightbox(historyUrls[hid])"
+            />
+          </button>
+        </div>
+
+        <div v-if="!isDigitalHuman" class="h3-mode-block">
+          <H3GenModeSelect :model-value="shotH3Mode(shot)" @update:model-value="setShotH3Mode(shot, $event)" />
+          <FramePairSlots
+            v-if="shotH3Mode(shot) === 'fl2va'"
+            :first-id="shot.firstFrameAssetId"
+            :last-id="shot.lastFrameAssetId"
+            first-hint="空则用本镜配图"
+            @update:first-id="project.updateShot(shot.id, { firstFrameAssetId: $event })"
+            @update:last-id="project.updateShot(shot.id, { lastFrameAssetId: $event })"
+          />
+        </div>
+        <div class="shot-info">
+          <div v-if="!isDigitalHuman" class="info-row">
+            <VideoModelSelect :model-value="shotVideoModel(shot)" @update:model-value="setShotVideoModel(shot, $event)" />
+          </div>
+          <div v-if="!isDigitalHuman && videoAllows1080p(shotVideoModel(shot)) && shotH3Mode(shot) !== 'fl2va'" class="info-row">
+            <span>清晰度</span>
+            <VideoResolutionSeg
+              :model-value="shotVideoResolution(shot)"
+              @update:model-value="setShotVideoResolution(shot, $event)"
+            />
+          </div>
+          <label class="info-row">
+            <span>时长</span>
+            <AppNumberInput
+              class="dur-input"
+              :min="videoMinSeconds(shotVideoModel(shot))"
+              :max="videoMaxSeconds(shotVideoModel(shot))"
+              step="1"
+              :value="shot.duration"
+              @change="project.updateShot(shot.id, { duration: clampShotDuration(shot, Number(($event.target as HTMLInputElement).value)) })" />
+          </label>
+          <label class="info-row">
+            <span>运镜</span>
+            <AppSelect
+              class="cam-select"
+              :value="shot.cameraMovement"
+              @change="project.updateShot(shot.id, { cameraMovement: $event as Shot['cameraMovement'] })"
+            >
+              <option value="push">推</option>
+              <option value="pull">拉</option>
+              <option value="pan">摇</option>
+              <option value="tilt">移</option>
+              <option value="orbit">环绕</option>
+              <option value="static">固定</option>
+            </AppSelect>
+          </label>
+          <label v-if="!isDigitalHuman" class="info-row">
+            <span>人声</span>
+            <AppSelect
+              class="cam-select"
+              :value="effectiveShotAudioMode(shot)"
+              @change="changeAudioMode(shot, $event as NonNullable<Shot['audioMode']>)"
+            >
+              <option value="h3-dialogue">H3 出镜对白 + 对口型</option>
+              <option value="h3-voiceover">H3 画外口播 + 人物闭嘴</option>
+              <option value="tts">后期 TTS + H3 不说话</option>
+              <option value="none">无口播，仅环境声</option>
+            </AppSelect>
+          </label>
+          <div v-else class="info-row">
+            <span>人声</span>
+            <strong>成片已带上传音频</strong>
+          </div>
+        </div>
+
+        <div class="shot-prompt">
+          <div class="prompt-bar">
+            <div class="prompt-label">实际提交给视频模型的提示词</div>
+            <div class="prompt-tools">
+              <button v-if="!externalTextOnly" class="reset-btn" :disabled="optimizing.has(shot.id)" @click="optimizeVideoPrompt(shot)">
+                {{ optimizing.has(shot.id) ? '优化中…' : '优化提示词' }}
+              </button>
+              <button v-if="!externalTextOnly" class="reset-btn" @click="resetVideoPrompt(shot)">按分镜动作重写</button>
+              <button class="reset-btn" @click="toggleExpanded(shot.id)">
+                {{ expanded.has(shot.id) ? '收起 H3 提交格式' : '看 H3 提交格式' }}
+              </button>
+            </div>
+          </div>
+          <textarea
+            class="prompt-edit"
+            rows="5"
+            :value="shot.compiledVideoPrompt ?? ''"
+            :placeholder="videoPromptPlaceholder"
+            @input="updateVideoPrompt(shot, ($event.target as HTMLTextAreaElement).value)"
+          />
+          <pre v-if="expanded.has(shot.id)" class="composed">{{ composedPrompt(shot) }}</pre>
+        </div>
+
+        <div class="shot-actions">
+          <GradientButton
+            v-if="!shot.videoAssetId"
+            size="sm"
+            icon="wand"
+            :loading="generating.has(shot.id)"
+            :disabled="generating.has(shot.id)"
+            @click="generateOne(shot, false)"
+          >
+            生成视频
+          </GradientButton>
+          <GradientButton
+            v-else
+            size="sm"
+            type="secondary"
+            icon="remake"
+            :loading="generating.has(shot.id)"
+            @click="generateOne(shot, false)"
+          >
+            重新生成
+          </GradientButton>
+          <GradientButton
+            size="sm"
+            type="ghost"
+            @click="pickerShotId = shot.id"
+          >
+            资源库选用
+          </GradientButton>
+        </div>
+      </GlassCard>
+    </div>
+
+    <AssetPicker
+      :open="!!pickerShotId"
+      kind="video"
+      :multiple="false"
+      title="从资源库选用视频片段"
+      @close="pickerShotId = null"
+      @confirm="onPickerConfirm"
+    />
+  </div>
+</template>
+
+<style scoped>
+.page {
+  padding: var(--space-6);
+  max-width: 1400px;
+  margin: 0 auto;
+}
+.page-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: var(--space-5);
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+.page-head h1 {
+  font-size: 24px;
+  font-weight: 700;
+  margin: 0 0 var(--space-1);
+}
+.page-head p {
+  font-size: 13px;
+  color: var(--color-text-3);
+  margin: 0;
+}
+.head-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.warn-card {
+  margin-bottom: var(--space-4);
+  border-color: var(--color-warning);
+  color: var(--color-warning);
+  background: rgba(245, 158, 11, 0.1);
+}
+.chain-card {
+  margin-bottom: var(--space-4);
+  border-color: var(--color-info, #60a5fa);
+  color: var(--color-text-2);
+  background: rgba(96, 165, 250, 0.1);
+  line-height: 1.6;
+}
+
+.chain-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+}
+
+.chain-row span {
+  flex: 1;
+}
+
+.chain-off {
+  flex: none;
+  padding: 4px 10px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chain-off:hover {
+  background: var(--color-fill-hover, rgba(255, 255, 255, 0.06));
+  color: var(--color-text-1);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: var(--space-4);
+}
+.shot-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.shot-card.generating {
+  border-color: var(--color-accent);
+}
+.shot-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.shot-num {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-sm);
+  background: var(--grad-primary);
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.shot-title {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.shot-video {
+  position: relative;
+  aspect-ratio: 16/9;
+  background: #000;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+}
+.shot-video .app-media-video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+.placeholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  color: var(--color-text-4);
+  background: var(--grad-primary-soft);
+  position: relative;
+}
+.still {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.35;
+}
+.placeholder-icon {
+  font-size: 32px;
+  opacity: 0.5;
+  z-index: 1;
+}
+.placeholder-text {
+  font-size: 12px;
+  z-index: 1;
+}
+.progress-msg {
+  font-size: 11px;
+  color: var(--color-text-3);
+  text-align: center;
+  padding: 0 var(--space-2);
+}
+.history {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.history-label {
+  font-size: 10px;
+  color: var(--color-text-4);
+  font-weight: 600;
+}
+.history-item {
+  width: 36px;
+  height: 36px;
+  border-radius: 4px;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  padding: 0;
+}
+.history-item img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.h3-mode-block {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.shot-info {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  font-size: 12px;
+}
+.info-row {
+  min-width: 0;
+  background: var(--color-bg-2);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--color-text-3);
+  gap: 10px;
+}
+.info-row span {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.info-row strong {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-1);
+}
+.info-row:last-child {
+  grid-column: 1 / -1;
+}
+.dur-input,
+.cam-select {
+  min-width: 0;
+  flex: 1;
+  width: auto;
+  max-width: 100%;
+  background: var(--color-bg-1);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-1);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.shot-prompt {
+  background: var(--color-bg-2);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+.prompt-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+  flex-wrap: wrap;
+}
+.prompt-label {
+  font-size: 10px;
+  color: var(--color-text-4);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 600;
+}
+.prompt-tools {
+  display: flex;
+  gap: 4px;
+}
+.reset-btn {
+  font-size: 11px;
+  color: var(--color-accent-2);
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+.reset-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.reset-btn:hover {
+  background: var(--grad-primary-soft);
+}
+.prompt-edit {
+  width: 100%;
+  resize: vertical;
+  min-height: 88px;
+  background: var(--color-bg-1);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  color: var(--color-text-2);
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 8px;
+  font-family: inherit;
+}
+.prompt-edit:focus {
+  outline: none;
+  border-color: var(--color-accent);
+}
+.composed {
+  margin: 8px 0 0;
+  padding: 8px;
+  background: var(--color-bg-0);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  color: var(--color-text-3);
+  white-space: pre-wrap;
+  line-height: 1.5;
+  max-height: 160px;
+  overflow: auto;
+}
+.shot-actions {
+  display: flex;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+.shot-actions > * {
+  flex: 1;
+}
+.voice-pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--color-text-3);
+}
+.vo-player {
+  width: 100%;
+  margin-top: 8px;
+  height: 32px;
+}
+</style>

@@ -1,0 +1,283 @@
+/**
+ * 素材 store
+ *
+ * 维护：素材元数据 + 运行时 blob URL 缓存
+ */
+
+import { defineStore } from 'pinia'
+import { ref, computed } from 'vue'
+import {
+  saveAsset,
+  loadAssetBlob,
+  listAssets,
+  deleteAsset,
+  loadThumbBlob,
+  saveThumb,
+  assetAbsPath,
+  getActiveProjectDir
+} from '@/services/storage'
+import { desktop, isDesktop, assetFileUrl } from '@/services/desktop'
+import {
+  probeMedia,
+  extractVideoThumbnail,
+  ensurePlayableBlob,
+  isMostlyDarkImage
+} from '@/services/ffmpeg'
+import type { Asset, ID } from '@/types'
+
+export const useAssetsStore = defineStore('assets', () => {
+  const all = ref<Asset[]>([])
+  const urlCache = new Map<ID, string>()
+  const thumbCache = new Map<ID, string>()
+  let cacheDir = getActiveProjectDir()
+
+  const images = computed(() => all.value.filter((a) => a.kind === 'image'))
+  const videos = computed(() => all.value.filter((a) => a.kind === 'video'))
+
+  /** 刷新列表 */
+  async function refresh() {
+    const dir = refreshCacheScope()
+    const list = await listAssets()
+    if (getActiveProjectDir() === dir) all.value = list
+  }
+
+  /** 添加素材（AI 生成或上传） */
+  async function add(
+    blob: Blob,
+    kind: Asset['kind'],
+    source: Asset['source'],
+    options: {
+      id?: ID
+      filename?: string
+      prompt?: string
+      projectId?: string
+      shotId?: string
+      videoGeneration?: Asset['videoGeneration']
+      frameRole?: 'board'
+    } = {}
+  ): Promise<Asset> {
+    const dir = refreshCacheScope()
+    const typed = await ensurePlayableBlob(blob, kind)
+    const info = await probeMedia(typed)
+    const id = options.id ?? `${kind}_${Date.now().toString(36)}_${Math.random()
+      .toString(36)
+      .slice(2, 6)}`
+    const base = {
+      id,
+      kind,
+      mimeType: typed.type || guessMime(kind),
+      filename: options.filename ?? `${kind}_${id}`,
+      size: typed.size,
+      createdAt: Date.now(),
+      source,
+      prompt: options.prompt,
+      projectId: options.projectId,
+      shotId: options.shotId,
+      videoGeneration: options.videoGeneration
+    }
+    let asset: Asset
+    let thumbBlob: Blob | undefined
+    if (kind === 'image') {
+      asset = { ...base, kind: 'image', frameRole: options.frameRole, width: info.width, height: info.height }
+    } else if (kind === 'video') {
+      // 防止把预览图误存成视频资产（下载后变成 png/jpg）
+      const head = new Uint8Array(await typed.slice(0, 16).arrayBuffer())
+      const isJpeg = head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff
+      const isPng =
+        head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4e && head[3] === 0x47
+      const isGif = head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46
+      if (isJpeg || isPng || isGif || (typed.type || '').startsWith('image/')) {
+        throw new Error(
+          '生成结果是图片而不是视频（常见于工作流只输出了预览帧）。请检查图生视频节点是否输出 mp4。'
+        )
+      }
+      // 元数据偶尔读成 0 秒，不能因此把已经下好的 mp4 扔掉
+      if (
+        typed.size < 80_000 &&
+        info.duration != null &&
+        Number.isFinite(info.duration) &&
+        info.duration < 0.2
+      ) {
+        throw new Error(
+          `视频时长异常（${info.duration.toFixed(2)}s），可能只是一张静态帧被标成了视频`
+        )
+      }
+      thumbBlob = await extractVideoThumbnail(typed).catch(() => undefined)
+      asset = {
+        ...base,
+        kind: 'video',
+        width: info.width,
+        height: info.height,
+        duration: info.duration ?? 0,
+        fps: 30,
+        hasAudio: info.hasAudio ?? false
+      }
+    } else {
+      asset = { ...base, kind: 'audio', duration: info.duration ?? 0 }
+    }
+    await saveAsset(asset, typed, thumbBlob, dir)
+    if (getActiveProjectDir() === dir) {
+      all.value = [asset, ...all.value.filter((item) => item.id !== asset.id)]
+    }
+    return asset
+  }
+
+  function guessMime(kind: Asset['kind']): string {
+    return kind === 'image' ? 'image/png' : kind === 'video' ? 'video/mp4' : 'audio/mpeg'
+  }
+
+  /** 本机工作区使用支持 Range 的媒体路由，浏览器独立预览使用 Blob。 */
+  async function getUrl(id: ID): Promise<string | undefined> {
+    const dir = refreshCacheScope()
+    const meta = all.value.find((a) => a.id === id)
+    const cached = urlCache.get(id)
+    if (cached) return cached
+    if (isDesktop()) {
+      const abs = await assetAbsPath(id)
+      if (getActiveProjectDir() !== dir) return undefined
+      if (abs) {
+        const url = assetFileUrl(abs)
+        urlCache.set(id, url)
+        return url
+      }
+    }
+    const blob = await loadAssetBlob(id)
+    if (!blob) return undefined
+    const typed = await ensurePlayableBlob(blob, meta?.kind, meta?.mimeType)
+    if (getActiveProjectDir() !== dir) return undefined
+    const url = URL.createObjectURL(typed)
+    urlCache.set(id, url)
+    return url
+  }
+
+  /** 获取缩略图 URL */
+  async function getThumbUrl(id: ID): Promise<string | undefined> {
+    const dir = refreshCacheScope()
+    if (thumbCache.has(id)) return thumbCache.get(id)
+    const blob = await loadThumbBlob(id)
+    if (!blob || getActiveProjectDir() !== dir) return undefined
+    const url = URL.createObjectURL(blob)
+    thumbCache.set(id, url)
+    return url
+  }
+
+  /** 没有封面、或封面是黑场，就现场截一帧存起来 */
+  async function ensureThumb(id: ID): Promise<string | undefined> {
+    const dir = refreshCacheScope()
+    const stored = await loadThumbBlob(id)
+    if (getActiveProjectDir() !== dir) return undefined
+    if (stored && stored.size >= 80) {
+      const dark = await isMostlyDarkImage(stored).catch(() => false)
+      if (getActiveProjectDir() !== dir) return undefined
+      if (!dark) {
+        if (thumbCache.has(id)) return thumbCache.get(id)
+        const url = URL.createObjectURL(stored)
+        thumbCache.set(id, url)
+        return url
+      }
+      if (thumbCache.has(id)) {
+        URL.revokeObjectURL(thumbCache.get(id)!)
+        thumbCache.delete(id)
+      }
+    }
+    const blob = await loadAssetBlob(id)
+    if (!blob) return undefined
+    const thumb = await extractVideoThumbnail(blob).catch(() => undefined)
+    if (!thumb || thumb.size < 80 || getActiveProjectDir() !== dir) return undefined
+    await saveThumb(id, thumb)
+    if (getActiveProjectDir() !== dir) return undefined
+    if (thumbCache.has(id)) URL.revokeObjectURL(thumbCache.get(id)!)
+    const url = URL.createObjectURL(thumb)
+    thumbCache.set(id, url)
+    return url
+  }
+
+  /** 直接拿 blob（用于 FFmpeg 处理） */
+  async function getBlob(id: ID): Promise<Blob | undefined> {
+    return loadAssetBlob(id)
+  }
+
+  /** 同步获取元数据（已加载的列表里） */
+  function getMeta(id: ID): Asset | undefined {
+    if (getActiveProjectDir() !== cacheDir) return undefined
+    return all.value.find((a) => a.id === id)
+  }
+
+  /** 把资源库或其它来源的素材收进当前项目；已在项目里则原样返回。 */
+  async function adopt(
+    id: ID,
+    kind: Asset['kind'],
+    options: { projectId?: string; shotId?: string } = {}
+  ): Promise<Asset> {
+    const existing = getMeta(id)
+    if (existing && existing.kind === kind) return existing
+    let blob = await getBlob(id)
+    let meta = existing
+    if (!blob) {
+      const { useLibraryStore } = await import('./library')
+      const library = useLibraryStore()
+      blob = await library.getBlob(id)
+      meta = library.getMeta(id)
+    }
+    if (!blob) throw new Error('素材读取失败')
+    return add(blob, kind, meta?.source || 'uploaded', {
+      filename: meta?.filename,
+      prompt: meta?.prompt,
+      projectId: options.projectId,
+      shotId: options.shotId
+    })
+  }
+
+  async function remove(id: ID) {
+    const dir = refreshCacheScope()
+    await deleteAsset(id)
+    if (getActiveProjectDir() !== dir) return
+    if (urlCache.has(id) && urlCache.get(id)!.startsWith('blob:')) {
+      URL.revokeObjectURL(urlCache.get(id)!)
+    }
+    urlCache.delete(id)
+    if (thumbCache.has(id) && thumbCache.get(id)!.startsWith('blob:')) {
+      URL.revokeObjectURL(thumbCache.get(id)!)
+    }
+    thumbCache.delete(id)
+    await refresh()
+  }
+
+  /** 释放所有 URL */
+  function cleanup() {
+    for (const url of urlCache.values()) {
+      if (url.startsWith('blob:')) URL.revokeObjectURL(url)
+    }
+    for (const url of thumbCache.values()) {
+      if (url.startsWith('blob:')) URL.revokeObjectURL(url)
+    }
+    urlCache.clear()
+    thumbCache.clear()
+  }
+
+  function refreshCacheScope() {
+    const dir = getActiveProjectDir()
+    if (dir !== cacheDir) {
+      cleanup()
+      cacheDir = dir
+      all.value = []
+    }
+    return dir
+  }
+
+  return {
+    all,
+    images,
+    videos,
+    refresh,
+    add,
+    getUrl,
+    getThumbUrl,
+    ensureThumb,
+    getBlob,
+    getMeta,
+    remove,
+    adopt,
+    cleanup
+  }
+})
